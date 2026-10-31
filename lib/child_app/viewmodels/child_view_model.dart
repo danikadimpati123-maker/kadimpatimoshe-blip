@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' as android_plugins;
 import 'package:device_info_plus/device_info_plus.dart';
 
+import 'package:kidguard_child/data/models/telemetry_payload.dart';
 import '../core/services/rtdb_client_service.dart';
 import '../core/services/battery_service.dart';
 import '../core/services/location_service.dart';
