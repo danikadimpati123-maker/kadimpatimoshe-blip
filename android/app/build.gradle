@@ -45,8 +45,8 @@ android {
     defaultConfig {
         applicationId "com.kidguard.child"
         // Required for WebRTC and modern foreground services
-        minSdkVersion 24
-        targetSdkVersion 34
+        minSdk 24
+        targetSdk 34
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
 

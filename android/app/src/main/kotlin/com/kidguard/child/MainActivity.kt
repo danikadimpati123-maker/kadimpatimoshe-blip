@@ -1,130 +1,85 @@
 package com.kidguard.child
 
-import android.content.Intent
-import android.os.Build
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
+import android.view.View
+import android.widget.Button
+import android.widget.ImageView
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.kidguard.child.service.AudioCaptureService
-import com.kidguard.child.service.LocationForegroundService
-import com.kidguard.child.service.MediaProjectionForegroundService
-import com.kidguard.child.util.ServiceStarter
-import io.flutter.embedding.android.FlutterActivity
-import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.plugin.common.MethodChannel
 
 /**
  * MainActivity
- * Native Flutter entry point bridging method channels to Android 14 Foreground Services.
+ * Native Android Activity for the KidGuard Parent Companion / Installer.
  */
-class MainActivity : FlutterActivity() {
+class MainActivity : AppCompatActivity() {
 
-    companion object {
-        private const val CHANNEL_NAME = "com.kidguard.child/native_services"
-        private const val EVENT_CHANNEL_NOTIFICATIONS = "com.kidguard.child/notifications"
-    }
+    private val PERMISSION_REQUEST_CODE = 1001
 
-    private var notificationEventSink: io.flutter.plugin.common.EventChannel.EventSink? = null
-    private val notificationReceiver = object : android.content.BroadcastReceiver() {
-        override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
-            if (intent?.action == com.kidguard.child.service.ChildNotificationListenerService.ACTION_NEW_NOTIFICATION) {
-                val data = mapOf(
-                    "packageName" to intent.getStringExtra("package_name"),
-                    "title" to intent.getStringExtra("title"),
-                    "text" to intent.getStringExtra("text"),
-                    "timestamp" to intent.getLongExtra("timestamp", System.currentTimeMillis())
-                )
-                notificationEventSink?.success(data)
-            }
-        }
-    }
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
-    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-        super.configureFlutterEngine(flutterEngine)
+        // Initialize UI components
+        val btnInstallKid = findViewById<Button>(R.id.btn_install_kid)
+        val btnOpenKid = findViewById<Button>(R.id.btn_open_kid)
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_NAME).setMethodCallHandler { call, result ->
-            when (call.method) {
-                "startAll" -> {
-                    ServiceStarter.startAll(this)
-                    result.success(true)
-                }
-                "stopAll" -> {
-                    stopService(Intent(this, LocationForegroundService::class.java))
-                    stopService(Intent(this, AudioCaptureService::class.java))
-                    result.success(true)
-                }
-                "startLocationService" -> {
-                    ServiceStarter.startService(this, LocationForegroundService::class.java)
-                    result.success(true)
-                }
-                "stopLocationService" -> {
-                    stopService(Intent(this, LocationForegroundService::class.java))
-                    result.success(true)
-                }
-                "startAudioService" -> {
-                    ServiceStarter.startService(this, AudioCaptureService::class.java)
-                    result.success(true)
-                }
-                "stopAudioService" -> {
-                    stopService(Intent(this, AudioCaptureService::class.java))
-                    result.success(true)
-                }
-                "stopScreenMirrorService" -> {
-                    val intent = Intent(this, MediaProjectionForegroundService::class.java).apply {
-                        action = MediaProjectionForegroundService.ACTION_STOP_PROJECTION
-                    }
-                    startService(intent)
-                    result.success(true)
-                }
-                "hasUsagePermission" -> {
-                    val collector = com.kidguard.child.usage.UsageStatsCollector(this)
-                    result.success(collector.hasPermission())
-                }
-                "getTopApps" -> {
-                    val collector = com.kidguard.child.usage.UsageStatsCollector(this)
-                    val limit = call.argument<Int>("limit") ?: 10
-                    val days = call.argument<Int>("days") ?: 7
-                    val pm = packageManager
-                    val stats = collector.getTopApps(limit, days).map { usage ->
-                        val appName = try {
-                            val appInfo = pm.getApplicationInfo(usage.packageName, 0)
-                            pm.getApplicationLabel(appInfo).toString()
-                        } catch (e: Exception) {
-                            usage.packageName
-                        }
-                        mapOf(
-                            "packageName" to usage.packageName,
-                            "appName" to appName,
-                            "foregroundTimeMs" to usage.totalTimeInForeground,
-                            "lastTimeUsed" to usage.lastTimeUsed
-                        )
-                    }
-                    result.success(stats)
-                }
-                "getForegroundApp" -> {
-                    val collector = com.kidguard.child.usage.UsageStatsCollector(this)
-                    result.success(collector.getForegroundAppPackageName())
-                }
-                else -> result.notImplemented()
-            }
+        // Navigation Controls
+        val ivCamera = findViewById<ImageView>(R.id.iv_camera_stream)
+        val ivScreenMirror = findViewById<ImageView>(R.id.iv_screen_mirror)
+        val ivAudio = findViewById<ImageView>(R.id.iv_audio_telemetry)
+
+        // Install Button Logic
+        btnInstallKid.setOnClickListener {
+            // Simulate installation
+            btnInstallKid.visibility = View.GONE
+            btnOpenKid.visibility = View.VISIBLE
+            Toast.makeText(this, "KidGuard installed successfully.", Toast.LENGTH_SHORT).show()
         }
 
-        io.flutter.plugin.common.EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL_NOTIFICATIONS).setStreamHandler(
-            object : io.flutter.plugin.common.EventChannel.StreamHandler {
-                override fun onListen(arguments: Any?, events: io.flutter.plugin.common.EventChannel.EventSink?) {
-                    notificationEventSink = events
-                    val filter = android.content.IntentFilter(com.kidguard.child.service.ChildNotificationListenerService.ACTION_NEW_NOTIFICATION)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        registerReceiver(notificationReceiver, filter, android.content.Context.RECEIVER_EXPORTED)
-                    } else {
-                        registerReceiver(notificationReceiver, filter)
-                    }
-                }
+        // Open Button Logic
+        btnOpenKid.setOnClickListener {
+            Toast.makeText(this, "Launching KidGuard...", Toast.LENGTH_SHORT).show()
+        }
 
-                override fun onCancel(arguments: Any?) {
-                    unregisterReceiver(notificationReceiver)
-                    notificationEventSink = null
-                }
-            }
+        // Navigation Listeners
+        ivCamera.setOnClickListener { 
+            Toast.makeText(this, "Camera stream requested", Toast.LENGTH_SHORT).show() 
+        }
+        ivScreenMirror.setOnClickListener { 
+            Toast.makeText(this, "Screen mirror requested", Toast.LENGTH_SHORT).show() 
+        }
+        ivAudio.setOnClickListener { 
+            Toast.makeText(this, "Audio telemetry requested", Toast.LENGTH_SHORT).show() 
+        }
+
+        // Runtime permission check
+        checkAndRequestPermissions()
+    }
+
+    private fun checkAndRequestPermissions() {
+        val permissions = arrayOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
         )
+
+        val listPermissionsNeeded = mutableListOf<String>()
+
+        for (permission in permissions) {
+            if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+                listPermissionsNeeded.add(permission)
+            }
+        }
+
+        if (listPermissionsNeeded.isNotEmpty()) {
+            ActivityCompat.requestPermissions(
+                this, 
+                listPermissionsNeeded.toTypedArray(), 
+                PERMISSION_REQUEST_CODE
+            )
+        }
     }
 }

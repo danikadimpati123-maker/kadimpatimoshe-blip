@@ -330,12 +330,13 @@ export const startParentWebRTCSession = async (
   let pc: RTCPeerConnection | null = null;
   let answerUnsub: (() => void) | null = null;
   let candidatesUnsub: (() => void) | null = null;
+  let errorUnsub: (() => void) | null = null;
   let validityUnsub: (() => void) | null = null;
   let isCleanedUp = false;
   let currentFacing = options.cameraFacing || 'front';
 
   // Actively check and listen if child pairing code is still valid in Firebase RTDB
-  const activePairingCode = options.pairingCode || (deviceId.startsWith('dev_') ? deviceId.replace('dev_', '') : deviceId);
+  const activePairingCode = (options.pairingCode || (deviceId.startsWith('dev_') ? deviceId.replace('dev_', '') : deviceId)).toUpperCase();
   if (activePairingCode) {
     validityUnsub = subscribeToChildPairingCodeValidity(
       activePairingCode,
@@ -413,11 +414,11 @@ export const startParentWebRTCSession = async (
         if (event.candidate && database && !isCleanedUp) {
           try {
             const candJson = event.candidate.toJSON();
-            const candRef = push(ref(database, `devices/${deviceId}/signaling/parentCandidates`));
+            const candRef = push(ref(database, `devices/${activePairingCode}/signaling/parentCandidates`));
             await set(candRef, candJson);
 
-            // Also post to devices/${deviceId}/stream/parentCandidates for Kotlin child app compatibility
-            const streamIceRef = push(ref(database, `devices/${deviceId}/stream/parentCandidates`));
+            // Also post to devices/${activePairingCode}/stream/parentCandidates for Kotlin child app compatibility
+            const streamIceRef = push(ref(database, `devices/${activePairingCode}/stream/parentCandidates`));
             await set(streamIceRef, {
               candidate: event.candidate.candidate,
               sdpMid: event.candidate.sdpMid,
@@ -440,7 +441,7 @@ export const startParentWebRTCSession = async (
 
       // If Firebase RTDB is active, publish offer and listen for child answer
       if (database) {
-        const signalingRef = ref(database, `devices/${deviceId}/signaling`);
+        const signalingRef = ref(database, `devices/${activePairingCode}/signaling`);
         const offerPayload = {
           type: offer.type,
           sdp: offer.sdp,
@@ -453,26 +454,27 @@ export const startParentWebRTCSession = async (
         
         // Reset old signaling artifacts and post new offer using deep paths
         const signalingUpdates: Record<string, any> = {};
-        signalingUpdates[`devices/${deviceId}/signaling/offer`] = offerPayload;
-        signalingUpdates[`devices/${deviceId}/signaling/answer`] = null;
-        signalingUpdates[`devices/${deviceId}/signaling/childCandidates`] = null;
-        signalingUpdates[`devices/${deviceId}/signaling/parentCandidates`] = null;
-        signalingUpdates[`devices/${deviceId}/signaling/state`] = 'offer_created';
-        signalingUpdates[`devices/${deviceId}/signaling/updatedAt`] = Date.now();
+        signalingUpdates[`devices/${activePairingCode}/signaling/offer`] = offerPayload;
+        signalingUpdates[`devices/${activePairingCode}/signaling/answer`] = null;
+        signalingUpdates[`devices/${activePairingCode}/signaling/childCandidates`] = null;
+        signalingUpdates[`devices/${activePairingCode}/signaling/parentCandidates`] = null;
+        signalingUpdates[`devices/${activePairingCode}/signaling/error`] = null;
+        signalingUpdates[`devices/${activePairingCode}/signaling/state`] = 'offer_created';
+        signalingUpdates[`devices/${activePairingCode}/signaling/updatedAt`] = Date.now();
         
         await update(ref(database), signalingUpdates);
 
-        // Also update devices/${deviceId}/stream node for KidGuardSignaling compatibility
+        // Also update devices/${activePairingCode}/stream node for KidGuardSignaling compatibility
         const streamUpdates: Record<string, any> = {};
-        streamUpdates[`devices/${deviceId}/stream/offer`] = offerPayload;
-        streamUpdates[`devices/${deviceId}/stream/answer`] = null;
-        streamUpdates[`devices/${deviceId}/stream/status`] = 'offer_created';
-        streamUpdates[`devices/${deviceId}/stream/updatedAt`] = Date.now();
+        streamUpdates[`devices/${activePairingCode}/stream/offer`] = offerPayload;
+        streamUpdates[`devices/${activePairingCode}/stream/answer`] = null;
+        streamUpdates[`devices/${activePairingCode}/stream/status`] = 'offer_created';
+        streamUpdates[`devices/${activePairingCode}/stream/updatedAt`] = Date.now();
         
         await update(ref(database), streamUpdates);
 
         // Listen for child SDP Answer on signaling/answer
-        const answerRef = ref(database, `devices/${deviceId}/signaling/answer`);
+        const answerRef = ref(database, `devices/${activePairingCode}/signaling/answer`);
         const unsubAns = onValue(answerRef, async (snapshot) => {
           if (!snapshot.exists() || !pc || isCleanedUp) return;
           const answerData = snapshot.val();
@@ -490,7 +492,7 @@ export const startParentWebRTCSession = async (
         });
 
         // Also listen for child SDP Answer on stream/answer
-        const streamAnswerRef = ref(database, `devices/${deviceId}/stream/answer`);
+        const streamAnswerRef = ref(database, `devices/${activePairingCode}/stream/answer`);
         const unsubStreamAns = onValue(streamAnswerRef, async (snapshot) => {
           if (!snapshot.exists() || !pc || isCleanedUp) return;
           const answerData = snapshot.val();
@@ -512,7 +514,7 @@ export const startParentWebRTCSession = async (
         };
 
         // Listen for child ICE Candidates on signaling/childCandidates
-        const childCandRef = ref(database, `devices/${deviceId}/signaling/childCandidates`);
+        const childCandRef = ref(database, `devices/${activePairingCode}/signaling/childCandidates`);
         const unsubCand = onValue(childCandRef, async (snapshot) => {
           if (!snapshot.exists() || !pc || isCleanedUp) return;
           const candidatesObj = snapshot.val();
@@ -531,7 +533,7 @@ export const startParentWebRTCSession = async (
         });
 
         // Also listen for child ICE Candidates on stream/childCandidates (Standardized Path)
-        const streamChildCandRef = ref(database, `devices/${deviceId}/stream/childCandidates`);
+        const streamChildCandRef = ref(database, `devices/${activePairingCode}/stream/childCandidates`);
         const unsubStreamChildCand = onValue(streamChildCandRef, async (snapshot) => {
           if (!snapshot.exists() || !pc || isCleanedUp) return;
           const candidatesObj = snapshot.val();
@@ -555,10 +557,22 @@ export const startParentWebRTCSession = async (
           off(childCandRef, 'value', unsubCand);
           off(streamChildCandRef, 'value', unsubStreamChildCand);
         };
+
+        // Listen for child errors
+        const errorRef = ref(database, `devices/${activePairingCode}/signaling/error`);
+        const unsubErr = onValue(errorRef, (snapshot) => {
+          if (!snapshot.exists() || isCleanedUp) return;
+          const errData = snapshot.val();
+          if (errData && errData.message) {
+            options.onError?.(new Error(`Child Hardware Error: ${errData.message} (${errData.name || 'Unknown'})`));
+            options.onStatusChange?.(`Child Error: ${errData.message}`);
+          }
+        });
+        errorUnsub = () => off(errorRef, 'value', unsubErr);
       }
 
       // Signal child to turn on camera and answer WebRTC signaling
-      await sendRemoteCommand(deviceId, parentUid, childId, 'startStream', {
+      await sendRemoteCommand(activePairingCode, parentUid, childId, 'startStream', {
         cameraFacing: currentFacing,
         timestamp: Date.now(),
       });
@@ -583,14 +597,14 @@ export const startParentWebRTCSession = async (
     },
     switchCamera: async (facing: 'front' | 'back') => {
       currentFacing = facing;
-      await sendRemoteCommand(deviceId, parentUid, childId, 'switchCamera', {
+      await sendRemoteCommand(activePairingCode, parentUid, childId, 'switchCamera', {
         cameraFacing: facing,
       });
       if (database) {
         try {
           const switchUpdates: Record<string, any> = {};
-          switchUpdates[`devices/${deviceId}/signaling/offer/facing`] = facing;
-          switchUpdates[`devices/${deviceId}/stream/offer/facing`] = facing;
+          switchUpdates[`devices/${activePairingCode}/signaling/offer/facing`] = facing;
+          switchUpdates[`devices/${activePairingCode}/stream/offer/facing`] = facing;
           await update(ref(database), switchUpdates);
         } catch {
           // ignore
@@ -616,12 +630,12 @@ export const startParentWebRTCSession = async (
       if (database) {
         try {
           const cleanupUpdates: Record<string, any> = {};
-          cleanupUpdates[`devices/${deviceId}/signaling/state`] = 'closed';
-          cleanupUpdates[`devices/${deviceId}/signaling/closedAt`] = Date.now();
+          cleanupUpdates[`devices/${activePairingCode}/signaling/state`] = 'closed';
+          cleanupUpdates[`devices/${activePairingCode}/signaling/closedAt`] = Date.now();
           await update(ref(database), cleanupUpdates);
         } catch {}
       }
-      sendRemoteCommand(deviceId, parentUid, childId, 'stopStream').catch(() => {});
+      sendRemoteCommand(activePairingCode, parentUid, childId, 'stopStream').catch(() => {});
     },
   };
 };
@@ -729,7 +743,10 @@ export const startParentScreenShareSession = async (
   let pc: RTCPeerConnection | null = null;
   let answerUnsub: (() => void) | null = null;
   let candidatesUnsub: (() => void) | null = null;
+  let errorUnsub: (() => void) | null = null;
   let isCleanedUp = false;
+  
+  const activePairingCode = (deviceId.startsWith('dev_') ? deviceId.replace('dev_', '') : deviceId).toUpperCase();
 
   const cleanupListeners = () => {
     if (answerUnsub) {
@@ -786,7 +803,7 @@ export const startParentScreenShareSession = async (
       pc.onicecandidate = async (event) => {
         if (event.candidate && database && !isCleanedUp) {
           try {
-            const candRef = push(ref(database, `devices/${deviceId}/screenSignaling/parentCandidates`));
+            const candRef = push(ref(database, `devices/${activePairingCode}/screenSignaling/parentCandidates`));
             await set(candRef, event.candidate.toJSON());
           } catch (e) {
             console.warn('Error saving parent screen ICE candidate:', e);
@@ -801,23 +818,24 @@ export const startParentScreenShareSession = async (
 
       if (database) {
         const screenSignalingUpdates: Record<string, any> = {};
-        screenSignalingUpdates[`devices/${deviceId}/screenSignaling/offer`] = {
+        screenSignalingUpdates[`devices/${activePairingCode}/screenSignaling/offer`] = {
           type: offer.type,
           sdp: offer.sdp,
           mediaType: 'screen',
           timestamp: Date.now(),
           initiator: parentUid,
         };
-        screenSignalingUpdates[`devices/${deviceId}/screenSignaling/answer`] = null;
-        screenSignalingUpdates[`devices/${deviceId}/screenSignaling/childCandidates`] = null;
-        screenSignalingUpdates[`devices/${deviceId}/screenSignaling/parentCandidates`] = null;
-        screenSignalingUpdates[`devices/${deviceId}/screenSignaling/state`] = 'offer_created';
-        screenSignalingUpdates[`devices/${deviceId}/screenSignaling/updatedAt`] = Date.now();
+        screenSignalingUpdates[`devices/${activePairingCode}/screenSignaling/answer`] = null;
+        screenSignalingUpdates[`devices/${activePairingCode}/screenSignaling/childCandidates`] = null;
+        screenSignalingUpdates[`devices/${activePairingCode}/screenSignaling/parentCandidates`] = null;
+        screenSignalingUpdates[`devices/${activePairingCode}/screenSignaling/error`] = null;
+        screenSignalingUpdates[`devices/${activePairingCode}/screenSignaling/state`] = 'offer_created';
+        screenSignalingUpdates[`devices/${activePairingCode}/screenSignaling/updatedAt`] = Date.now();
         
         await update(ref(database), screenSignalingUpdates);
 
         // Listen for child screen answer
-        const answerRef = ref(database, `devices/${deviceId}/screenSignaling/answer`);
+        const answerRef = ref(database, `devices/${activePairingCode}/screenSignaling/answer`);
         const unsubAns = onValue(answerRef, async (snapshot) => {
           if (!snapshot.exists() || !pc || isCleanedUp) return;
           const answerData = snapshot.val();
@@ -836,7 +854,7 @@ export const startParentScreenShareSession = async (
         answerUnsub = () => off(answerRef, 'value', unsubAns);
 
         // Listen for child screen ICE candidates
-        const childCandRef = ref(database, `devices/${deviceId}/screenSignaling/childCandidates`);
+        const childCandRef = ref(database, `devices/${activePairingCode}/screenSignaling/childCandidates`);
         const unsubCand = onValue(childCandRef, async (snapshot) => {
           if (!snapshot.exists() || !pc || isCleanedUp) return;
           const candidatesObj = snapshot.val();
@@ -852,10 +870,22 @@ export const startParentScreenShareSession = async (
           }
         });
         candidatesUnsub = () => off(childCandRef, 'value', unsubCand);
+
+        // Listen for child screen errors
+        const errorRef = ref(database, `devices/${activePairingCode}/screenSignaling/error`);
+        const unsubErr = onValue(errorRef, (snapshot) => {
+          if (!snapshot.exists() || isCleanedUp) return;
+          const errData = snapshot.val();
+          if (errData && errData.message) {
+            options.onError?.(new Error(`Child Screen Error: ${errData.message} (${errData.name || 'Unknown'})`));
+            options.onStatusChange?.(`Screen Error: ${errData.message}`);
+          }
+        });
+        errorUnsub = () => off(errorRef, 'value', unsubErr);
       }
 
       // Signal child device to start screen stream
-      await sendRemoteCommand(deviceId, parentUid, childId, 'startScreenShare', {
+      await sendRemoteCommand(activePairingCode, parentUid, childId, 'startScreenShare', {
         timestamp: Date.now(),
       });
 
@@ -889,14 +919,288 @@ export const startParentScreenShareSession = async (
       if (database) {
         try {
           const cleanupUpdates: Record<string, any> = {};
-          cleanupUpdates[`devices/${deviceId}/screenSignaling/state`] = 'closed';
-          cleanupUpdates[`devices/${deviceId}/screenSignaling/closedAt`] = Date.now();
+          cleanupUpdates[`devices/${activePairingCode}/screenSignaling/state`] = 'closed';
+          cleanupUpdates[`devices/${activePairingCode}/screenSignaling/closedAt`] = Date.now();
           await update(ref(database), cleanupUpdates);
         } catch {}
       }
-      sendRemoteCommand(deviceId, parentUid, childId, 'stopScreenShare').catch(() => {});
+      sendRemoteCommand(activePairingCode, parentUid, childId, 'stopScreenShare').catch(() => {});
     },
   };
+};
+
+/**
+ * Initializes a child WebRTC signaling session (responder) over Firebase RTDB
+ */
+export const startChildWebRTCSession = async (
+  pairingCode: string,
+  options: {
+    onStream: (stream: MediaStream) => void;
+    onStatusChange?: (status: string) => void;
+    onError?: (err: Error) => void;
+  }
+): Promise<{ cleanup: () => void }> => {
+  let pc: RTCPeerConnection | null = null;
+  let offerUnsub: (() => void) | null = null;
+  let candidatesUnsub: (() => void) | null = null;
+  let isCleanedUp = false;
+  let localStream: MediaStream | null = null;
+
+  const cleanup = () => {
+    isCleanedUp = true;
+    if (offerUnsub) offerUnsub();
+    if (candidatesUnsub) candidatesUnsub();
+    if (pc) {
+      pc.close();
+      pc = null;
+    }
+    if (localStream) {
+      localStream.getTracks().forEach(t => t.stop());
+      localStream = null;
+    }
+  };
+
+  try {
+    options.onStatusChange?.('Requesting camera permissions…');
+    // Force direct hardware access without fallbacks
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true
+    });
+    options.onStream(localStream);
+
+    const initPC = () => {
+      if (pc) pc.close();
+      pc = new RTCPeerConnection(peerConfiguration);
+
+      localStream?.getTracks().forEach(track => {
+        pc?.addTrack(track, localStream!);
+      });
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate && database && !isCleanedUp) {
+          const candRef = push(ref(database!, `devices/${pairingCode}/signaling/childCandidates`));
+          set(candRef, event.candidate.toJSON());
+          
+          // Compat
+          const streamIceRef = push(ref(database!, `devices/${pairingCode}/stream/childCandidates`));
+          set(streamIceRef, {
+            candidate: event.candidate.candidate,
+            sdpMid: event.candidate.sdpMid,
+            sdpMLineIndex: event.candidate.sdpMLineIndex,
+            from: 'child',
+            createdAt: Date.now(),
+          });
+        }
+      };
+
+      return pc;
+    };
+
+    if (database) {
+      const offerRef = ref(database, `devices/${pairingCode}/signaling/offer`);
+      const handleOffer = async (snapshot: any) => {
+        if (!snapshot.exists() || isCleanedUp) return;
+        const offerData = snapshot.val();
+        if (!offerData || !offerData.sdp) return;
+
+        options.onStatusChange?.('Received signaling offer, connecting…');
+        const peer = initPC();
+        await peer.setRemoteDescription(new RTCSessionDescription(offerData));
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+
+        const signalingUpdates: Record<string, any> = {};
+        signalingUpdates[`devices/${pairingCode}/signaling/answer`] = {
+          type: answer.type,
+          sdp: answer.sdp,
+          timestamp: Date.now(),
+          from: 'child'
+        };
+        signalingUpdates[`devices/${pairingCode}/signaling/error`] = null; // Clear previous errors
+        signalingUpdates[`devices/${pairingCode}/signaling/state`] = 'answer_sent';
+        
+        // Compat
+        signalingUpdates[`devices/${pairingCode}/stream/answer`] = {
+          type: answer.type,
+          sdp: answer.sdp,
+          timestamp: Date.now(),
+          from: 'child'
+        };
+        signalingUpdates[`devices/${pairingCode}/stream/status`] = 'answer_sent';
+
+        await update(ref(database!), signalingUpdates);
+      };
+
+      const unsubOffer = onValue(offerRef, handleOffer);
+      offerUnsub = () => off(offerRef, 'value', unsubOffer);
+
+      const parentCandRef = ref(database!, `devices/${pairingCode}/signaling/parentCandidates`);
+      const handleParentCand = (snapshot: any) => {
+        if (!snapshot.exists() || !pc || isCleanedUp) return;
+        const candidates = snapshot.val();
+        if (candidates && typeof candidates === 'object') {
+          Object.values(candidates).forEach((cand: any) => {
+            if (cand && (cand.candidate || cand.sdpMid)) {
+              pc?.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+            }
+          });
+        }
+      };
+      const unsubCand = onValue(parentCandRef, handleParentCand);
+      candidatesUnsub = () => off(parentCandRef, 'value', unsubCand);
+    }
+
+  } catch (err: any) {
+    console.error('Child WebRTC hardware error:', err);
+    if (database) {
+      try {
+        await update(ref(database, `devices/${pairingCode}/signaling`), {
+          error: {
+            message: err.message || 'Unknown camera error',
+            name: err.name || 'Error',
+            timestamp: Date.now()
+          },
+          state: 'error'
+        });
+      } catch (e) {
+        console.warn('Failed to report hardware error to RTDB:', e);
+      }
+    }
+    options.onError?.(err);
+  }
+
+  return { cleanup };
+};
+
+/**
+ * Initializes a child WebRTC screen share signaling session (responder)
+ */
+export const startChildScreenShareSession = async (
+  pairingCode: string,
+  options: {
+    onStream: (stream: MediaStream) => void;
+    onStatusChange?: (status: string) => void;
+    onError?: (err: Error) => void;
+  }
+): Promise<{ cleanup: () => void }> => {
+  let pc: RTCPeerConnection | null = null;
+  let offerUnsub: (() => void) | null = null;
+  let candidatesUnsub: (() => void) | null = null;
+  let isCleanedUp = false;
+  let localStream: MediaStream | null = null;
+
+  const cleanup = () => {
+    isCleanedUp = true;
+    if (offerUnsub) offerUnsub();
+    if (candidatesUnsub) candidatesUnsub();
+    if (pc) {
+      pc.close();
+      pc = null;
+    }
+    if (localStream) {
+      localStream.getTracks().forEach(t => t.stop());
+      localStream = null;
+    }
+  };
+
+  try {
+    options.onStatusChange?.('Requesting screen capture permissions…');
+    if (!navigator.mediaDevices.getDisplayMedia) {
+      throw new Error('Screen sharing is not supported in this browser.');
+    }
+    localStream = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        displaySurface: 'monitor',
+        logicalSurface: true,
+        cursor: 'always'
+      } as any,
+      audio: false
+    });
+    options.onStream(localStream);
+
+    const initPC = () => {
+      if (pc) pc.close();
+      pc = new RTCPeerConnection(peerConfiguration);
+
+      localStream?.getTracks().forEach(track => {
+        pc?.addTrack(track, localStream!);
+      });
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate && database && !isCleanedUp) {
+          const candRef = push(ref(database!, `devices/${pairingCode}/screenSignaling/childCandidates`));
+          set(candRef, event.candidate.toJSON());
+        }
+      };
+
+      return pc;
+    };
+
+    if (database) {
+      const offerRef = ref(database!, `devices/${pairingCode}/screenSignaling/offer`);
+      const handleOffer = async (snapshot: any) => {
+        if (!snapshot.exists() || isCleanedUp) return;
+        const offerData = snapshot.val();
+        if (!offerData || !offerData.sdp) return;
+
+        options.onStatusChange?.('Received screen share offer, connecting…');
+        const peer = initPC();
+        await peer.setRemoteDescription(new RTCSessionDescription(offerData));
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+
+        const signalingUpdates: Record<string, any> = {};
+        signalingUpdates[`devices/${pairingCode}/screenSignaling/answer`] = {
+          type: answer.type,
+          sdp: answer.sdp,
+          timestamp: Date.now(),
+          from: 'child'
+        };
+        signalingUpdates[`devices/${pairingCode}/screenSignaling/error`] = null; // Clear previous errors
+        signalingUpdates[`devices/${pairingCode}/screenSignaling/state`] = 'answer_sent';
+        await update(ref(database!), signalingUpdates);
+      };
+
+      const unsubOffer = onValue(offerRef, handleOffer);
+      offerUnsub = () => off(offerRef, 'value', unsubOffer);
+
+      const parentCandRef = ref(database!, `devices/${pairingCode}/screenSignaling/parentCandidates`);
+      const handleParentCand = (snapshot: any) => {
+        if (!snapshot.exists() || !pc || isCleanedUp) return;
+        const candidates = snapshot.val();
+        if (candidates && typeof candidates === 'object') {
+          Object.values(candidates).forEach((cand: any) => {
+            if (cand && (cand.candidate || cand.sdpMid)) {
+              pc?.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+            }
+          });
+        }
+      };
+      const unsubCand = onValue(parentCandRef, handleParentCand);
+      candidatesUnsub = () => off(parentCandRef, 'value', unsubCand);
+    }
+
+  } catch (err: any) {
+    console.error('Child screen share hardware error:', err);
+    if (database) {
+      try {
+        await update(ref(database, `devices/${pairingCode}/screenSignaling`), {
+          error: {
+            message: err.message || 'Unknown screen share error',
+            name: err.name || 'Error',
+            timestamp: Date.now()
+          },
+          state: 'error'
+        });
+      } catch (e) {
+        console.warn('Failed to report screen hardware error to RTDB:', e);
+      }
+    }
+    options.onError?.(err);
+  }
+
+  return { cleanup };
 };
 
 

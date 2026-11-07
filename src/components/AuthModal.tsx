@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { X, Shield, Eye, EyeOff, Loader2, Sparkles } from 'lucide-react';
 import { auth, saveParentSession } from '../services/firebase';
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, sendEmailVerification, signOut } from 'firebase/auth';
 
 interface AuthModalProps {
   onClose: () => void;
@@ -15,58 +15,80 @@ export const AuthModal: React.FC<AuthModalProps> = ({ onClose, onSuccess }) => {
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const validateInputs = () => {
+    // Basic email regex
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      setError('Please enter a valid email address.');
+      return false;
+    }
+    
+    // Disposable domain blocking
+    const disposableDomains = ['mailinator.com', '10minutemail.com', 'guerrillamail.com', 'temp-mail.org', 'yopmail.com'];
+    const domain = email.split('@')[1];
+    if (disposableDomains.includes(domain.toLowerCase())) {
+        setError('Temporary or disposable email domains are not allowed.');
+        return false;
+    }
+
+    // Simple password complexity check: at least 8 characters
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters long.');
+      return false;
+    }
+    return true;
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!email || !password) {
-      setError('Please enter both email and password.');
-      return;
-    }
+    if (!validateInputs()) return;
 
     setIsSubmitting(true);
     setError(null);
+    setMessage(null);
 
     try {
       if (auth) {
         if (isRegistering) {
           const cred = await createUserWithEmailAndPassword(auth, email, password);
-          const userData = { uid: cred.user.uid, email: cred.user.email || email };
-          saveParentSession(userData);
-          onSuccess(userData);
+          await sendEmailVerification(cred.user);
+          await signOut(auth); // Sign out to prevent unverified access
+          setMessage('Account created! Please check your email to verify your account before logging in.');
+          setIsSubmitting(false);
+          // Do not call onSuccess or onClose
         } else {
           const cred = await signInWithEmailAndPassword(auth, email, password);
+          if (!cred.user.emailVerified) {
+             await signOut(auth);
+             throw new Error('Please verify your email address before logging in.');
+          }
           const userData = { uid: cred.user.uid, email: cred.user.email || email };
           saveParentSession(userData);
           onSuccess(userData);
+          onClose();
         }
       } else {
-        // Local session fallback
-        const userData = { uid: `parent_${email.replace(/\W/g, '_')}`, email };
-        saveParentSession(userData);
-        onSuccess(userData);
+        throw new Error('Authentication service unavailable.');
       }
-      onClose();
     } catch (err: any) {
-      // If Firebase Auth fails with network/config, fall back gracefully to authenticated session
       console.warn('Firebase auth attempt returned:', err);
-      if (err.code === 'auth/network-request-failed' || err.code === 'auth/configuration-not-found') {
-        const userData = { uid: `parent_${email.replace(/\W/g, '_')}`, email };
-        saveParentSession(userData);
-        onSuccess(userData);
-        onClose();
-      } else {
-        setError(err.message || 'Authentication error.');
+      let errorMessage = err.message || 'Authentication error.';
+      if (err.code === 'auth/invalid-credential') {
+        errorMessage = 'Invalid email or password. Please check your credentials or create a new account.';
+      } else if (err.code === 'auth/too-many-requests') {
+        errorMessage = 'Too many attempts. Please try again later.';
+      } else if (err.code === 'auth/user-not-found') {
+        errorMessage = 'User not found. Please create an account first.';
+      } else if (err.code === 'auth/email-already-in-use') {
+        errorMessage = 'This email is already registered. Please sign in instead.';
+      } else if (err.code === 'auth/weak-password') {
+        errorMessage = 'Password should be at least 6 characters.';
       }
-    } finally {
+      setError(errorMessage);
       setIsSubmitting(false);
     }
-  };
-
-  const handleDemoLogin = () => {
-    const demoUser = { uid: 'parent_demo_user_1', email: 'parent@kidguard.family' };
-    saveParentSession(demoUser);
-    onSuccess(demoUser);
-    onClose();
   };
 
   return (
@@ -96,7 +118,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({ onClose, onSuccess }) => {
             {error}
           </div>
         )}
+        
+        {message && (
+          <div className="p-3 mb-4 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-700">
+            {message}
+          </div>
+        )}
 
+        {!message && (
         <form onSubmit={handleSubmit} className="space-y-3.5">
           <div>
             <label className="block text-xs font-bold text-neutral-700 mb-1">Email Address</label>
@@ -157,18 +186,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({ onClose, onSuccess }) => {
           >
             {isRegistering ? 'Already have an account? Log in' : 'New to KidGuard? Create account'}
           </button>
-
-          <div className="pt-3 border-t border-neutral-100">
-            <button
-              type="button"
-              onClick={handleDemoLogin}
-              className="w-full py-2 px-3 rounded-lg text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 transition-colors flex items-center justify-center gap-1.5"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
-              Quick Demo Login (One-click)
-            </button>
-          </div>
         </form>
+        )}
       </div>
     </div>
   );

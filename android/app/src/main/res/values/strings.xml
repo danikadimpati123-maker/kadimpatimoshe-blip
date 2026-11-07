@@ -2,4 +2,7 @@
 <resources>
     <string name="app_name">KidGuard</string>
     <string name="accessibility_service_description">KidGuard Accessibility Service protects children by monitoring active applications, enforcing parental screen time limits, and blocking inappropriate web content.</string>
+    <string name="Common_KidsInstaller_ApkName">KidGuard Parent Companion</string>
+    <string name="Common_InstallChildApp_Button">Install KidGuard Child App</string>
+    <string name="Download_Page_Button4">Open KidGuard</string>
 </resources>

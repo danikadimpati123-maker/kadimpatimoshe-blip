@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="Common_KidsInstaller_ApkName">KidGuard పేరెంట్ కంపానియన్</string>
+    <string name="Common_InstallChildApp_Button">KidGuard చైల్డ్ యాప్ ఇన్స్టాల్ చేయండి</string>
+    <string name="Download_Page_Button4">KidGuard తెరవండి</string>
+</resources>

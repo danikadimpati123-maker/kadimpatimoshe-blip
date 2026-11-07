@@ -117,13 +117,16 @@ class WebRTCSignalingService : Service() {
 
     private fun startStreaming(type: String, facing: String) {
         executor.execute {
+            // Ensure previous resources are cleaned before starting a new stream (e.g. lens switch)
+            stopStreaming()
+            
             setupPeerConnection()
             if (type == "camera") {
                 setupCameraStream(facing)
             } else {
-                // Screen share implementation would go here (MediaProjection)
                 Log.w(TAG, "Screen share via WebRTC not fully implemented in this module yet.")
             }
+            // CRITICAL: Start listening for signaling messages (Offers/ICE) from the parent
             startSignalingListener()
         }
     }
@@ -140,7 +143,13 @@ class WebRTCSignalingService : Service() {
         peerConnection = peerConnectionFactory?.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
             override fun onIceCandidate(candidate: IceCandidate) {
                 Log.d(TAG, "New Ice Candidate: ${candidate.sdp}")
-                uploadIceCandidate(candidate)
+                val candidateMap = mapOf(
+                    "candidate" to candidate.sdp,
+                    "sdpMid" to candidate.sdpMid,
+                    "sdpMLineIndex" to candidate.sdpMLineIndex,
+                    "timestamp" to System.currentTimeMillis()
+                )
+                db.child("devices/$deviceCode/stream/childCandidates").push().setValue(candidateMap)
             }
 
             override fun onDataChannel(dc: DataChannel) {}
@@ -165,6 +174,7 @@ class WebRTCSignalingService : Service() {
         val videoSource = peerConnectionFactory?.createVideoSource(false)
         videoCapturer?.initialize(surfaceTextureHelper, this, videoSource?.capturerObserver)
         videoCapturer?.startCapture(1280, 720, 24)
+        Log.d(TAG, "Camera capturer started")
 
         videoTrack = peerConnectionFactory?.createVideoTrack("VIDEO_TRACK_ID", videoSource)
         peerConnection?.addTrack(videoTrack)
@@ -188,6 +198,7 @@ class WebRTCSignalingService : Service() {
     }
 
     private fun startSignalingListener() {
+        Log.d(TAG, "Starting signaling listener for device: $deviceCode")
         val streamPath = "devices/$deviceCode/stream"
         db.child(streamPath).child("offer").addValueEventListener(object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
@@ -204,11 +215,12 @@ class WebRTCSignalingService : Service() {
 
         db.child(streamPath).child("parentCandidates").addChildEventListener(object : ChildEventListener {
             override fun onChildAdded(snapshot: DataSnapshot, previousChildName: String?) {
-                val candidate = snapshot.child("candidate").getValue(String::class.java) ?: return
-                val sdpMid = snapshot.child("sdpMid").getValue(String::class.java) ?: ""
-                val sdpMLineIndex = snapshot.child("sdpMLineIndex").getValue(Int::class.java) ?: 0
+                val candMap = snapshot.value as? Map<String, Any> ?: return
+                val sdp = candMap["candidate"] as? String ?: return
+                val sdpMid = candMap["sdpMid"] as? String ?: return
+                val sdpMLineIndex = (candMap["sdpMLineIndex"] as? Long)?.toInt() ?: 0
                 
-                peerConnection?.addIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, candidate))
+                peerConnection?.addIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, sdp))
             }
             override fun onChildChanged(snapshot: DataSnapshot, previousChildName: String?) {}
             override fun onChildRemoved(snapshot: DataSnapshot) {}
@@ -218,6 +230,7 @@ class WebRTCSignalingService : Service() {
     }
 
     private fun handleOffer(sdp: String) {
+        Log.d(TAG, "Handling SDP offer: $sdp")
         val remoteDescription = SessionDescription(SessionDescription.Type.OFFER, sdp)
         peerConnection?.setRemoteDescription(object : SdpObserver {
             override fun onCreateSuccess(sdp: SessionDescription) {}
@@ -233,12 +246,26 @@ class WebRTCSignalingService : Service() {
         val constraints = MediaConstraints()
         peerConnection?.createAnswer(object : SdpObserver {
             override fun onCreateSuccess(sdp: SessionDescription) {
-                peerConnection?.setLocalDescription(this, sdp)
-                uploadAnswer(sdp)
+                Log.d(TAG, "Create answer success, setting local description...")
+                peerConnection?.setLocalDescription(object : SdpObserver {
+                    override fun onSetSuccess() {
+                        Log.d(TAG, "Set local description success, uploading answer...")
+                        uploadAnswer(sdp)
+                    }
+                    override fun onSetFailure(error: String?) {
+                        Log.e(TAG, "Set Local Description Failed: $error")
+                    }
+                    override fun onCreateSuccess(p0: SessionDescription?) {}
+                    override fun onCreateFailure(p0: String?) {}
+                }, sdp)
             }
+
+            override fun onCreateFailure(error: String?) {
+                Log.e(TAG, "Create Answer Failed: $error")
+            }
+
             override fun onSetSuccess() {}
-            override fun onCreateFailure(error: String) {}
-            override fun onSetFailure(error: String) {}
+            override fun onSetFailure(error: String?) {}
         }, constraints)
     }
 
@@ -248,29 +275,40 @@ class WebRTCSignalingService : Service() {
             "sdp" to sdp.description,
             "timestamp" to System.currentTimeMillis()
         )
+        
         db.child("devices/$deviceCode/stream/answer").setValue(answer)
-    }
-
-    private fun uploadIceCandidate(candidate: IceCandidate) {
-        val candMap = mapOf(
-            "candidate" to candidate.sdp,
-            "sdpMid" to candidate.sdpMid,
-            "sdpMLineIndex" to candidate.sdpMLineIndex,
-            "timestamp" to System.currentTimeMillis()
-        )
-        db.child("devices/$deviceCode/stream/childCandidates").push().setValue(candMap)
+            .addOnSuccessListener {
+                Log.d(TAG, "Answer successfully uploaded to Firebase RTDB")
+            }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Failed to upload answer: ${e.message}")
+            }
     }
 
     private fun stopStreaming() {
-        videoCapturer?.stopCapture()
-        videoCapturer?.dispose()
-        surfaceTextureHelper?.dispose()
-        peerConnection?.close()
-        peerConnectionFactory?.dispose()
-        
-        // Update status in RTDB
-        if (deviceCode.isNotBlank()) {
-            db.child("devices/$deviceCode/stream/status").setValue("stopped")
+        try {
+            videoCapturer?.stopCapture()
+            videoCapturer?.dispose()
+            videoCapturer = null
+            
+            surfaceTextureHelper?.dispose()
+            surfaceTextureHelper = null
+            
+            peerConnection?.close()
+            peerConnection = null
+            
+            peerConnectionFactory?.dispose()
+            peerConnectionFactory = null
+            
+            // Re-initialize factory for next use if needed
+            initializePeerConnectionFactory()
+            
+            // Update status in RTDB
+            if (deviceCode.isNotBlank()) {
+                db.child("devices/$deviceCode/stream/status").setValue("stopped")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during stopStreaming: ${e.message}")
         }
     }
 

@@ -323,7 +323,15 @@ class ParentViewModel extends ChangeNotifier {
     await _webRtcService.stopScreenMirror(pairingCode);
     await _webRtcService.stopAudioStream(pairingCode);
 
-    _devices.removeWhere((d) => d.pairingCode == pairingCode);
+    final deviceIndex = _devices.indexWhere((d) => d.pairingCode == pairingCode);
+    final ChildDevice? device = deviceIndex >= 0 ? _devices[deviceIndex] : null;
+
+    if (device != null) {
+      _devices.removeAt(deviceIndex);
+      // Also delete the parent link
+      await _rtdbClient.deletePath('parents/$parentUid/children/${device.childId}');
+    }
+
     if (_selectedDevice?.pairingCode == pairingCode) {
       _selectedDevice = _devices.isNotEmpty ? _devices.first : null;
     }

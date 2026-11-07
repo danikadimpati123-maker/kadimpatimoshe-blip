@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="Common_KidsInstaller_ApkName">KidGuard पेरेंट साथी</string>
+    <string name="Common_InstallChildApp_Button">KidGuard चाइल्ड ऐप इंस्टॉल करें</string>
+    <string name="Download_Page_Button4">KidGuard खोलें</string>
+</resources>

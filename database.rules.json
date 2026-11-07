@@ -21,15 +21,17 @@
       }
     },
     "devices": {
+      ".read": "auth != null",
+      ".write": "auth != null",
       "$code": {
         ".read": "auth != null",
-        ".write": "auth != null && (!data.exists() || data.child('parentUid').val() == auth.uid || newData.child('parentUid').val() == auth.uid)"
+        ".write": "auth != null && (!data.exists() || data.child('parentUid').val() == auth.uid || !newData.exists() || newData.child('parentUid').val() == auth.uid)"
       }
     },
     "pairings": {
       "$code": {
         ".read": "auth != null",
-        ".write": "auth != null && (!data.exists() || data.child('parentUid').val() == auth.uid || newData.child('parentUid').val() == auth.uid)"
+        ".write": "auth != null && (!data.exists() || data.child('parentUid').val() == auth.uid || !newData.exists() || newData.child('parentUid').val() == auth.uid)"
       }
     },
     "pairing_codes": {
@@ -46,8 +48,24 @@
     },
     "control": {
       "$code": {
-        ".read": "auth != null",
-        ".write": "auth != null"
+        ".read": true,
+        ".write": true
+      }
+    },
+    "devices": {
+      "$code": {
+        "signaling": {
+          ".read": true,
+          ".write": true
+        },
+        "stream": {
+          ".read": true,
+          ".write": true
+        },
+        "screenSignaling": {
+          ".read": true,
+          ".write": true
+        }
       }
     }
   }

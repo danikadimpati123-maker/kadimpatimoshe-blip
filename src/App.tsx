@@ -31,7 +31,8 @@ import {
   Plus,
   Loader2
 } from 'lucide-react';
-import { auth, database, sanitizeForRTDB, subscribeToChildDevices, getCurrentParent, saveParentSession, clearParentSession, pairChildDevice, unlinkChildDevice, deleteChildDevice, clearAllParentDevices, signInWithEmail, signUpWithEmail, signOut as fbSignOut, onAuthStateChanged, getOrCreateChildPairingCode } from './services/firebase';
+import { auth, database, sanitizeForRTDB, subscribeToChildDevices, getCurrentParent, saveParentSession, clearParentSession, pairChildDevice, unlinkChildDevice, deleteChildDevice, clearAllParentDevices, handleResetConsoleData, signInWithEmail, signUpWithEmail, signOut as fbSignOut, onAuthStateChanged, getOrCreateChildPairingCode, sendEmailVerification } from './services/firebase';
+import { startChildWebRTCSession, startChildScreenShareSession } from './services/webrtc';
 import { ref, update, onValue, off, set, onDisconnect, get } from 'firebase/database';
 import { ParentChildDevice, ConsoleNavSection } from './types';
 import { Header } from './components/Header';
@@ -66,8 +67,10 @@ export const App: React.FC = () => {
   const [authMode, setAuthMode] = useState<'email'>('email');
   const [enteredPin, setEnteredPin] = useState<string>('');
   const [passcodeError, setPasscodeError] = useState<string | null>(null);
-  const [emailInput, setEmailInput] = useState<string>('parent@kidguard.family');
-  const [passwordInput, setPasswordInput] = useState<string>('secret123');
+  const [emailInput, setEmailInput] = useState<string>('');
+  const [passwordInput, setPasswordInput] = useState<string>('');
+  const [isRegistering, setIsRegistering] = useState<boolean>(false);
+  const [verificationSent, setVerificationSent] = useState<boolean>(false);
 
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -108,32 +111,34 @@ export const App: React.FC = () => {
 
   const handleBulkDelete = async () => {
     if (selectedChildIds.length === 0) return;
-    if (!confirm(`Are you sure you want to permanently delete ${selectedChildIds.length} selected device(s)? This action cannot be undone.`)) return;
-
     setIsBulkDeleting(true);
     let successCount = 0;
     let failCount = 0;
 
     try {
       // Process all deletions in parallel for better performance
-      const results = await Promise.allSettled(
+      const results = await Promise.all(
         selectedChildIds.map(async (childId) => {
           const device = devices.find(d => d.childId === childId);
           if (device) {
-            return deleteChildDevice(device.pairingCode, childId);
+            const success = await deleteChildDevice(device.pairingCode || device.deviceId || childId, childId);
+            if (success) {
+              successCount++;
+            } else {
+              failCount++;
+            }
+            return success;
           }
-          throw new Error('Device not found');
+          failCount++;
+          return false;
         })
       );
 
-      successCount = results.filter(r => r.status === 'fulfilled').length;
-      failCount = results.filter(r => r.status === 'rejected').length;
-
       if (failCount > 0) {
-        const firstError = (results.find(r => r.status === 'rejected') as PromiseRejectedResult)?.reason?.message || 'Permission denied';
-        showToast(`Cleanup incomplete: ${successCount} deleted, ${failCount} failed. Error: ${firstError}`);
+        alert(`డివైజ్ డిలీట్ కాలేదు. ఒకసారి కన్సోల్ ఎర్రర్స్ చెక్ చేయండి. (${successCount} success, ${failCount} failed)`);
       } else {
         showToast(`Successfully deleted ${successCount} device(s).`);
+        console.log("Devices removed from UI successfully");
       }
       setSelectedChildIds([]);
     } catch (err: any) {
@@ -144,19 +149,14 @@ export const App: React.FC = () => {
   };
 
   const handleClearAllDevices = async () => {
-    if (!confirm("CRITICAL: This will permanently wipe ALL paired devices from your account. Continue?")) return;
+    if (!currentUser) return;
     
-    setIsBulkDeleting(true);
     try {
-      await clearAllParentDevices();
-      showToast("Account reset successfully. All devices removed.");
-      setSelectedChildIds([]);
-      setDevices([]);
-      setSelectedDevice(null);
+      await handleResetConsoleData(currentUser.uid);
+      showToast("Account reset successfully. Reloading...");
+      setTimeout(() => window.location.reload(), 1500);
     } catch (err: any) {
       showToast(`Reset failed: ${err.message}`);
-    } finally {
-      setIsBulkDeleting(false);
     }
   };
 
@@ -205,6 +205,10 @@ export const App: React.FC = () => {
   const [screenFrameCount, setScreenFrameCount] = useState<number>(0);
   const [cameraStreamActive, setCameraStreamActive] = useState<boolean>(false);
   const [audioStreamActive, setAudioStreamActive] = useState<boolean>(false);
+  const childVideoPreviewRef = useRef<HTMLVideoElement>(null);
+  const childScreenPreviewRef = useRef<HTMLVideoElement>(null);
+  const [childStreamStatus, setChildStreamStatus] = useState<string>('');
+  const [childScreenStatus, setChildScreenStatus] = useState<string>('');
   
   // Tracking which parent has claimed this child
   const [parentLink, setParentLink] = useState<{ parentUid: string; childId: string } | null>(null);
@@ -339,8 +343,8 @@ export const App: React.FC = () => {
         
         // If the device record is gone or unlinked, DO NOT re-create it.
         // This prevents "Zombie Re-sync" where a deleted device keeps coming back.
-        if (!data || data.status === 'unpaired' || data.status === 'deleted' || !data.parentUid) {
-          console.log(`[KidGuard] Sync aborted: Device ${pairingCode} is not paired or has been deleted.`);
+        if (!data || data.status === 'unpaired' || data.status === 'deleted' || !data.parentUid || data.isPaired === false) {
+          console.debug(`[KidGuard] Skipping sync for unlinked device.`);
           return;
         }
 
@@ -503,6 +507,100 @@ export const App: React.FC = () => {
     };
   }, [selectedRole]);
 
+  // Child-side WebRTC Camera Stream Effect
+  useEffect(() => {
+    if (selectedRole !== 'child' || !cameraStreamActive || !pairingCode) return;
+
+    let isMounted = true;
+    let sessionCleanup: (() => void) | null = null;
+
+    const runSession = async () => {
+      try {
+        const session = await startChildWebRTCSession(pairingCode, {
+          onStream: (stream) => {
+            if (isMounted && childVideoPreviewRef.current) {
+              childVideoPreviewRef.current.srcObject = stream;
+            }
+          },
+          onStatusChange: (status) => {
+            if (isMounted) setChildStreamStatus(status);
+          },
+          onError: (err) => {
+            if (isMounted) {
+              setChildStreamStatus(`Error: ${err.message}`);
+              setCameraStreamActive(false);
+            }
+          }
+        });
+        
+        if (isMounted) {
+          sessionCleanup = session.cleanup;
+        } else {
+          session.cleanup();
+        }
+      } catch (err: any) {
+        if (isMounted) {
+          setChildStreamStatus(`Failed to start stream: ${err.message}`);
+          setCameraStreamActive(false);
+        }
+      }
+    };
+
+    runSession();
+
+    return () => {
+      isMounted = false;
+      if (sessionCleanup) sessionCleanup();
+    };
+  }, [selectedRole, cameraStreamActive, pairingCode]);
+
+  // Child-side WebRTC Screen Mirror Effect
+  useEffect(() => {
+    if (selectedRole !== 'child' || !screenMirrorActive || !pairingCode) return;
+
+    let isMounted = true;
+    let sessionCleanup: (() => void) | null = null;
+
+    const runSession = async () => {
+      try {
+        const session = await startChildScreenShareSession(pairingCode, {
+          onStream: (stream) => {
+            if (isMounted && childScreenPreviewRef.current) {
+              childScreenPreviewRef.current.srcObject = stream;
+            }
+          },
+          onStatusChange: (status) => {
+            if (isMounted) setChildScreenStatus(status);
+          },
+          onError: (err) => {
+            if (isMounted) {
+              setChildScreenStatus(`Error: ${err.message}`);
+              setScreenMirrorActive(false);
+            }
+          }
+        });
+        
+        if (isMounted) {
+          sessionCleanup = session.cleanup;
+        } else {
+          session.cleanup();
+        }
+      } catch (err: any) {
+        if (isMounted) {
+          setChildScreenStatus(`Failed to start screen mirror: ${err.message}`);
+          setScreenMirrorActive(false);
+        }
+      }
+    };
+
+    runSession();
+
+    return () => {
+      isMounted = false;
+      if (sessionCleanup) sessionCleanup();
+    };
+  }, [selectedRole, screenMirrorActive, pairingCode]);
+
   // Real Hardware Geolocation API Listener
   useEffect(() => {
     if (selectedRole !== 'child') return;
@@ -596,65 +694,54 @@ export const App: React.FC = () => {
       setPasscodeError('Please enter both email and password.');
       return;
     }
+    
+    // Basic email validation
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(emailInput)) {
+      setPasscodeError('Please enter a valid email address.');
+      return;
+    }
+
+    setPasscodeError(null);
     try {
-      const user = await signInWithEmail(emailInput, passwordInput);
-      if (user) {
-        setCurrentUser({ uid: user.uid, email: user.email || '' });
-        setIsAuthenticated(true);
-        showToast('Signed In Successfully');
+      if (isRegistering) {
+        const user = await signUpWithEmail(emailInput, passwordInput);
+        if (user) {
+          await sendEmailVerification(user);
+          await fbSignOut();
+          setVerificationSent(true);
+          showToast('Verification email sent!');
+        }
+      } else {
+        const user = await signInWithEmail(emailInput, passwordInput);
+        if (user) {
+          if (!user.emailVerified) {
+            await fbSignOut();
+            setPasscodeError('Please verify your email address before signing in.');
+            return;
+          }
+          setCurrentUser({ uid: user.uid, email: user.email || '' });
+          setIsAuthenticated(true);
+          showToast('Signed In Successfully');
+        }
       }
     } catch (err: any) {
-      setPasscodeError(err.message || 'Authentication Failed');
+      let errorMessage = 'Authentication Failed';
+      if (err.code === 'auth/invalid-credential') {
+        errorMessage = 'Invalid email or password. Please check your credentials or create a new account.';
+      } else if (err.code === 'auth/too-many-requests') {
+        errorMessage = 'Too many attempts. Please try again later.';
+      } else if (err.code === 'auth/user-not-found') {
+        errorMessage = 'User not found. Please create an account first.';
+      } else if (err.code === 'auth/email-already-in-use') {
+        errorMessage = 'This email is already registered. Please sign in instead.';
+      } else if (err.code === 'auth/weak-password') {
+        errorMessage = 'Password should be at least 6 characters.';
+      }
+      setPasscodeError(errorMessage);
     }
   };
 
-  const handleQuickDemoAuth = async () => {
-    const demoEmail = 'parent@kidguard.family';
-    const demoPass = 'secret123';
-    
-    try {
-      showToast('Connecting to secure demo session...');
-      // 1. Attempt standard sign-in
-      try {
-        const user = await signInWithEmail(demoEmail, demoPass);
-        if (user) {
-          showToast('Demo Account Logged In');
-          return;
-        }
-      } catch (err: any) {
-        // Handle common auth errors by attempting registration
-        const errorCode = err.code || '';
-        if (
-          errorCode === 'auth/user-not-found' || 
-          errorCode === 'auth/invalid-credential' || 
-          errorCode === 'auth/wrong-password' ||
-          errorCode.includes('invalid')
-        ) {
-          console.log('Demo account needs provisioning, attempting sign-up...');
-          try {
-            const user = await signUpWithEmail(demoEmail, demoPass);
-            if (user) {
-              showToast('Demo Account Provisioned & Logged In');
-              return;
-            }
-          } catch (signUpErr: any) {
-            console.warn('Auto-provisioning failed:', signUpErr);
-            // If email already exists, it means the password might be different, 
-            // but we'll fall through to mock to ensure the UI at least loads.
-          }
-        }
-        throw err;
-      }
-    } catch (err) {
-      console.warn('Real Firebase Auth failed, using resilient local session:', err);
-      // Final fallback to mock session so the user can see the dashboard
-      const demo = { uid: 'parent_demo_01', email: demoEmail };
-      saveParentSession(demo);
-      setCurrentUser(demo);
-      setIsAuthenticated(true);
-      showToast('Demo Dashboard (Local Mode) Active');
-    }
-  };
 
   const handleSignOut = async () => {
     await fbSignOut();
@@ -769,16 +856,23 @@ export const App: React.FC = () => {
 
   const handleUnlinkDevice = async (device: ParentChildDevice) => {
     if (!currentUser) return;
-    if (confirm(`Are you sure you want to permanently delete ${device.deviceModelName}?`)) {
-      try {
-        showToast(`Deleting ${device.deviceModelName}...`);
-        await deleteChildDevice(device.pairingCode, device.childId);
+    try {
+      showToast(`Deleting ${device.deviceModelName}...`);
+      // 1. ఫైర్బేస్ నుండి డిలీట్ చేయడం
+      const success = await deleteChildDevice(device.pairingCode || device.deviceId || '', device.childId);
+      
+      if (success) {
+        // 2. లోకల్ స్టేట్ నుండి వెంటనే ఆ డివైజ్ని తొలగించడం (UI సింక్ అవ్వడానికి)
+        setDevices(prevDevices => prevDevices.filter(d => d.childId !== device.childId && d.deviceId !== device.deviceId));
         setSelectedChildIds(prev => prev.filter(id => id !== device.childId));
+        console.log("Device removed from UI successfully");
         showToast(`Successfully deleted ${device.deviceModelName}`);
-      } catch (err: any) {
-        console.error('Delete failed:', err);
-        showToast(`Error: ${err.message || 'Permission denied by database.'}`);
+      } else {
+        alert("డివైజ్ డిలీట్ కాలేదు. ఒకసారి కన్సోల్ ఎర్రర్స్ చెక్ చేయండి.");
       }
+    } catch (err) {
+      console.error("Error in handleUnlinkDevice:", err);
+      alert("డివైజ్ డిలీట్ కాలేదు. ఒకసారి కన్సోల్ ఎర్రర్స్ చెక్ చేయండి.");
     }
   };
 
@@ -825,53 +919,81 @@ export const App: React.FC = () => {
             </div>
             <h1 className="text-2xl font-extrabold text-[#1D302B] tracking-tight">KidGuard Protection</h1>
             <p className="text-xs text-[#71807B] mt-1">
-              Secure family supervision and child safety platform
+              {isRegistering ? 'Register to manage family devices' : 'Secure family supervision and child safety platform'}
             </p>
           </div>
 
-          {/* Mode A: Email & Password Form */}
-          <form onSubmit={handleEmailAuthSubmit} className="space-y-4">
-            <div>
-              <label className="block text-xs font-bold text-[#1D302B] mb-1">Email Address</label>
-              <input
-                type="email"
-                value={emailInput}
-                onChange={(e) => setEmailInput(e.target.value)}
-                className="w-full h-10 px-3 text-xs bg-[#F9FAF9] border border-[#E4E9E5] rounded-xl focus:border-[#0A9B70] focus:ring-2 focus:ring-emerald-100 outline-none text-[#1D302B]"
-                placeholder="parent@kidguard.family"
-                required
-              />
+          {verificationSent ? (
+            <div className="text-center space-y-4">
+              <div className="p-4 bg-emerald-50 text-emerald-700 rounded-xl border border-emerald-100 text-sm">
+                <CheckCircle2 className="w-8 h-8 mx-auto mb-2 text-emerald-500" />
+                <p className="font-bold">Verification Email Sent!</p>
+                <p className="text-xs mt-1">Please check your inbox ({emailInput}) and verify your account before logging in.</p>
+              </div>
+              <button
+                onClick={() => {
+                  setVerificationSent(false);
+                  setIsRegistering(false);
+                  setEmailInput('');
+                  setPasswordInput('');
+                }}
+                className="text-xs font-bold text-[#0A9B70] hover:underline"
+              >
+                Back to Sign In
+              </button>
             </div>
-            <div>
-              <label className="block text-xs font-bold text-[#1D302B] mb-1">Password</label>
-              <input
-                type="password"
-                value={passwordInput}
-                onChange={(e) => setPasswordInput(e.target.value)}
-                className="w-full h-10 px-3 text-xs bg-[#F9FAF9] border border-[#E4E9E5] rounded-xl focus:border-[#0A9B70] focus:ring-2 focus:ring-emerald-100 outline-none text-[#1D302B]"
-                placeholder="••••••••"
-                required
-              />
-            </div>
+          ) : (
+            <form onSubmit={handleEmailAuthSubmit} className="space-y-4">
+              {passcodeError && (
+                <div className="p-3 bg-rose-50 border border-rose-100 text-rose-600 text-xs rounded-xl flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                  {passcodeError}
+                </div>
+              )}
+              
+              <div>
+                <label className="block text-xs font-bold text-[#1D302B] mb-1">Email Address</label>
+                <input
+                  type="email"
+                  value={emailInput}
+                  onChange={(e) => setEmailInput(e.target.value)}
+                  className="w-full h-10 px-3 text-xs bg-[#F9FAF9] border border-[#E4E9E5] rounded-xl focus:border-[#0A9B70] focus:ring-2 focus:ring-emerald-100 outline-none text-[#1D302B]"
+                  placeholder="parent@example.com"
+                  required
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-[#1D302B] mb-1">Password</label>
+                <input
+                  type="password"
+                  value={passwordInput}
+                  onChange={(e) => setPasswordInput(e.target.value)}
+                  className="w-full h-10 px-3 text-xs bg-[#F9FAF9] border border-[#E4E9E5] rounded-xl focus:border-[#0A9B70] focus:ring-2 focus:ring-emerald-100 outline-none text-[#1D302B]"
+                  placeholder="••••••••"
+                  required
+                />
+              </div>
 
-            <button
-              type="submit"
-              className="w-full h-10 rounded-xl text-xs font-bold bg-[#0A9B70] hover:bg-[#087957] text-white transition-colors shadow-xs"
-            >
-              Sign In to KidGuard
-            </button>
-          </form>
+              <button
+                type="submit"
+                className="w-full h-10 rounded-xl text-xs font-bold bg-[#0A9B70] hover:bg-[#087957] text-white transition-colors shadow-xs"
+              >
+                {isRegistering ? 'Create Account' : 'Sign In to KidGuard'}
+              </button>
 
-          {/* Quick Demo Login */}
-          <div className="mt-6 pt-4 border-t border-[#E4E9E5]">
-            <button
-              onClick={handleQuickDemoAuth}
-              className="w-full py-2.5 px-3 rounded-xl text-xs font-bold bg-[#ECFDF5] hover:bg-[#D1FAE5] text-[#065F46] border border-[#A7F3D0] transition-all flex items-center justify-center gap-2"
-            >
-              <Sparkles className="w-4 h-4 text-[#0A9B70]" />
-              Quick Demo Access (One-Click)
-            </button>
-          </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsRegistering(!isRegistering);
+                  setPasscodeError(null);
+                }}
+                className="w-full text-center text-xs text-[#0A9B70] hover:underline font-semibold"
+              >
+                {isRegistering ? 'Already have an account? Sign In' : 'New to KidGuard? Create account'}
+              </button>
+            </form>
+          )}
+
         </div>
       </div>
     );
@@ -1116,6 +1238,27 @@ export const App: React.FC = () => {
                 </div>
                 <span className="text-blue-600">ACTIVE</span>
               </div>
+
+              <button 
+                onClick={async () => {
+                  try {
+                    await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    showToast('Permissions granted!');
+                  } catch (err: any) {
+                    console.warn('Manual permission grant failed:', err);
+                    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                      showToast('Permission denied. Please click the Lock icon in address bar to reset.');
+                    } else if (err.name === 'SecurityError' || err.message?.includes('policy')) {
+                      showToast('Browser policy restricted. Please use a regular browser window.');
+                    } else {
+                      showToast('Permission request failed. Check browser settings.');
+                    }
+                  }
+                }}
+                className="w-full py-3 rounded-2xl bg-[#0A9B70] text-white text-xs font-bold hover:bg-[#087957] transition-colors shadow-sm active:scale-[0.98]"
+              >
+                Grant Camera & Mic Access
+              </button>
             </div>
           </div>
 
@@ -1184,6 +1327,25 @@ export const App: React.FC = () => {
                     <p className="text-[11px] text-[#71807B] mt-0.5">
                       MediaProjection foreground capture to /devices/{pairingCode}/screen
                     </p>
+                    {screenMirrorActive && (
+                      <div className="mt-3 relative rounded-xl overflow-hidden bg-black aspect-video border border-indigo-500/30">
+                        <video 
+                          ref={childScreenPreviewRef} 
+                          autoPlay 
+                          playsInline 
+                          muted 
+                          className="w-full h-full object-cover"
+                        />
+                        <div className="absolute top-2 left-2 px-2 py-0.5 rounded bg-indigo-600 text-white text-[9px] font-bold animate-pulse">
+                          SCREEN SHARING
+                        </div>
+                        {childScreenStatus && (
+                          <div className="absolute bottom-0 inset-x-0 bg-black/60 backdrop-blur-sm p-1.5 text-[9px] text-white text-center font-medium">
+                            {childScreenStatus}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -1226,6 +1388,25 @@ export const App: React.FC = () => {
                     <p className="text-[11px] text-[#71807B] mt-0.5">
                       Live encrypted WebRTC camera service linked to /devices/{pairingCode}/stream
                     </p>
+                    {cameraStreamActive && (
+                      <div className="mt-3 relative rounded-xl overflow-hidden bg-black aspect-video border border-emerald-500/30">
+                        <video 
+                          ref={childVideoPreviewRef} 
+                          autoPlay 
+                          playsInline 
+                          muted 
+                          className="w-full h-full object-cover"
+                        />
+                        <div className="absolute top-2 left-2 px-2 py-0.5 rounded bg-emerald-500 text-white text-[9px] font-bold animate-pulse">
+                          LIVE PREVIEW
+                        </div>
+                        {childStreamStatus && (
+                          <div className="absolute bottom-0 inset-x-0 bg-black/60 backdrop-blur-sm p-1.5 text-[9px] text-white text-center font-medium">
+                            {childStreamStatus}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
 

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="Common_KidsInstaller_ApkName">رفيق الوالدين KidGuard</string>
+    <string name="Common_InstallChildApp_Button">تثبيت تطبيق KidGuard للأطفال</string>
+    <string name="Download_Page_Button4">فتح KidGuard</string>
+</resources>

@@ -8,6 +8,7 @@ import {
   onAuthStateChanged,
   signInWithPopup,
   GoogleAuthProvider,
+  sendEmailVerification,
   User,
   Auth,
   setPersistence,
@@ -70,7 +71,7 @@ try {
   console.warn('Firebase initialization note (running in resilient mode):', err);
 }
 
-export { auth, database, db, firebaseInitialized, onAuthStateChanged };
+export { auth, database, db, firebaseInitialized, onAuthStateChanged, sendEmailVerification };
 
 // Local persistence storage keys
 const LOCAL_STORAGE_DEVICES_KEY = 'kidguard_local_devices_';
@@ -173,17 +174,6 @@ export const getCurrentParent = (): { uid: string; email: string } | null => {
       email: user.email || 'parent@kidguard.family',
     };
   }
-  try {
-    const stored = localStorage.getItem(LOCAL_STORAGE_PARENT_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      // Verify if stored UID matches current auth (if auth is already loaded but user is null, stored is invalid)
-      if (auth && !auth.currentUser) return null;
-      return parsed;
-    }
-  } catch {
-    // ignore
-  }
   return null;
 };
 
@@ -218,7 +208,6 @@ export const signInWithEmail = async (email: string, pass: string): Promise<User
     saveParentSession({ uid: user.uid, email: user.email || '' });
     return user;
   } catch (err) {
-    console.error('Email Sign-In failed', err);
     throw err;
   }
 };
@@ -231,7 +220,6 @@ export const signUpWithEmail = async (email: string, pass: string): Promise<User
     saveParentSession({ uid: user.uid, email: user.email || '' });
     return user;
   } catch (err) {
-    console.error('Email Sign-Up failed', err);
     throw err;
   }
 };
@@ -319,11 +307,14 @@ export const subscribeToChildDevices = (
             }
           }
 
+          const rawPairingCode = String(item.pairingCode || item.bindingCode || key);
+          const pairingCode = rawPairingCode.replace(/^child_|^dev_/, '').toUpperCase();
+          
           devicesList.push({
             childId: item.childId || key,
             deviceId: item.deviceId || item.childId || key,
             childUid: item.childUid,
-            pairingCode: String(item.pairingCode || item.bindingCode || key),
+            pairingCode: pairingCode,
             status: item.status || 'bound',
             timestamp: item.timestamp || item.createdAt || new Date().toISOString(),
             isOnline: online,
@@ -1120,7 +1111,8 @@ export const subscribeToChildDeviceTelemetry = (
     (snapshot) => {
       if (!isSubscribed) return;
       const val = snapshot.val();
-      if (!val || typeof val !== 'object') {
+      if (!val || typeof val !== 'object' || val.isPaired === false) {
+        console.debug(`[KidGuard] Skipping sync for unlinked device.`);
         onTelemetryUpdate(null);
         return;
       }
@@ -1749,96 +1741,105 @@ export const pairChildDevice = async (
  * Prioritizes removing the link from the parent's account to ensure the UI updates
  * immediately, followed by a best-effort cleanup of global telemetry nodes.
  */
-export const deleteChildDevice = async (deviceCode: string, childId?: string): Promise<void> => {
-  if (!database) throw new Error('Database connection lost.');
+export const deleteChildDevice = async (deviceId: string, childId?: string): Promise<boolean> => {
+  if (!database) {
+    console.error("Delete failed: No database connection");
+    return false;
+  }
   
-  const cleanCode = (deviceCode || '').trim(); // DO NOT toUpperCase() - RTDB paths are case-sensitive
+  const cleanCode = (deviceId || '').trim(); 
   const parent = getCurrentParent();
-  if (!parent) throw new Error('Session expired.');
+  if (!parent) {
+    console.error("Delete failed: No active parent session");
+    return false;
+  }
 
-  console.log(`[KidGuard] deleteChildDevice: Comprehensive cleanup for ${cleanCode}`);
+  try {
+    console.log(`[KidGuard] deleteChildDevice: Comprehensive cleanup for ${cleanCode}`);
 
-  // 1. Identify all possible child IDs for this device in the parent's list
-  const childrenRef = ref(database, `parents/${parent.uid}/children`);
-  const snap = await get(childrenRef);
-  const children = snap.val();
-  const targetIds = new Set<string>();
-  
-  if (childId) targetIds.add(childId);
-  
-  if (children) {
-    Object.keys(children).forEach(id => {
-      const c = children[id];
-      const pCode = String(c?.pairingCode || c?.bindingCode || '').trim();
-      const cId = String(c?.childId || id).trim();
-      
-      if (
-        pCode === cleanCode || 
-        pCode.toUpperCase() === cleanCode.toUpperCase() ||
-        cId === cleanCode ||
-        cId === childId ||
-        id === childId ||
-        id === cleanCode
-      ) {
-        targetIds.add(id);
-      }
+    // 1. Identify all possible child IDs for this device in the parent's list
+    const childrenRef = ref(database, `parents/${parent.uid}/children`);
+    const snap = await get(childrenRef);
+    const children = snap.val();
+    const targetIds = new Set<string>();
+    
+    if (childId) targetIds.add(childId);
+    
+    if (children) {
+      Object.keys(children).forEach(id => {
+        const c = children[id];
+        const pCode = String(c?.pairingCode || c?.bindingCode || '').trim();
+        const cId = String(c?.childId || id).trim();
+        
+        if (
+          pCode === cleanCode || 
+          pCode.toUpperCase() === cleanCode.toUpperCase() ||
+          cId === cleanCode ||
+          cId === childId ||
+          id === childId ||
+          id === cleanCode
+        ) {
+          targetIds.add(id);
+        }
+      });
+    }
+
+    // 2. PRIMARY ACTION: Delete all identified parent link paths
+    const deletePaths: string[] = [];
+    targetIds.forEach(id => {
+      deletePaths.push(`parents/${parent.uid}/children/${id}`);
     });
+    
+    // Fallback paths if no IDs were found in the list but we have a code
+    if (cleanCode) {
+      deletePaths.push(`parents/${parent.uid}/children/${cleanCode}`);
+      deletePaths.push(`parents/${parent.uid}/children/${cleanCode.toUpperCase()}`);
+      deletePaths.push(`parents/${parent.uid}/children/child_${cleanCode}`);
+      deletePaths.push(`parents/${parent.uid}/children/child_${cleanCode.toUpperCase()}`);
+    }
+
+    // 3. GLOBAL CLEANUP: Remove shared nodes (Incorporating user's provided logic)
+    // Firebase లో ఏ పాత్ లో అయితే డివైజ్ సేవ్ అయిందో అదే పాత్ ఇవ్వాలి
+    // We normalize the code to uppercase and remove common prefixes to ensure a 100% match with RTDB keys
+    const baseCode = cleanCode.replace(/^child_|^dev_/, '').toUpperCase();
+    const globalCodes = new Set<string>([cleanCode, baseCode]);
+    
+    // Add variations for maximum resiliency
+    if (baseCode.includes('-')) {
+      globalCodes.add(baseCode.replace('FG-', ''));
+    }
+    
+    const globalPaths: string[] = [];
+    globalCodes.forEach(code => {
+      globalPaths.push(`devices/${code}`);
+      globalPaths.push(`pairings/${code}`);
+      globalPaths.push(`control/${code}`);
+      globalPaths.push(`pending_binds/${code}`);
+      globalPaths.push(`stream/${code}`);
+      globalPaths.push(`signaling/${code}`);
+    });
+
+    const allPathsToDelete = [...deletePaths, ...globalPaths];
+    
+    console.log(`[KidGuard] Deleting ${allPathsToDelete.length} paths for device ${cleanCode} (Normalized: ${baseCode})...`);
+    
+    // Perform deletions
+    await Promise.allSettled(allPathsToDelete.map(path => remove(ref(database!, path))));
+
+    // 4. Force local cache update
+    const current = loadLocalDevices(parent.uid);
+    const updated = current.filter(d => 
+      String(d.pairingCode).toUpperCase() !== cleanCode.toUpperCase() && 
+      !targetIds.has(d.childId)
+    );
+    saveLocalDevices(parent.uid, updated);
+    
+    console.log("Device deleted from database:", cleanCode);
+    return true;
+  } catch (error) {
+    console.error("Delete failed:", error);
+    return false;
   }
-
-  // 2. PRIMARY ACTION: Delete all identified parent link paths
-  const deletePaths: string[] = [];
-  targetIds.forEach(id => {
-    deletePaths.push(`parents/${parent.uid}/children/${id}`);
-  });
-  
-  // Fallback paths if no IDs were found in the list but we have a code
-  if (cleanCode) {
-    deletePaths.push(`parents/${parent.uid}/children/${cleanCode}`);
-    deletePaths.push(`parents/${parent.uid}/children/child_${cleanCode}`);
-  }
-
-  console.log(`[KidGuard] Deleting ${deletePaths.length} parent link paths...`);
-  const parentDeleteResults = await Promise.allSettled(deletePaths.map(path => 
-    remove(ref(database!, path))
-  ));
-
-  // Check if at least one parent link was successfully removed
-  const anyParentDeleted = parentDeleteResults.some(r => r.status === 'fulfilled');
-  if (!anyParentDeleted && deletePaths.length > 0) {
-    const error = (parentDeleteResults[0] as PromiseRejectedResult)?.reason?.message || 'Permission denied';
-    console.error(`[KidGuard] Failed to delete any parent links:`, error);
-    // We don't throw yet, let's try global cleanup too
-  }
-
-  // 3. GLOBAL CLEANUP: Remove shared nodes
-  const globalPaths = [
-    `devices/${cleanCode}`,
-    `pairings/${cleanCode}`,
-    `control/${cleanCode}`,
-    `pending_binds/${cleanCode}`,
-    `stream/${cleanCode}`,
-    `signaling/${cleanCode}`,
-    `devices/${cleanCode.replace('FG-', '')}`,
-    `pairings/${cleanCode.replace('FG-', '')}`,
-  ];
-  
-  if (cleanCode.toUpperCase() !== cleanCode) {
-    globalPaths.push(`devices/${cleanCode.toUpperCase()}`);
-    globalPaths.push(`pairings/${cleanCode.toUpperCase()}`);
-  }
-
-  console.log(`[KidGuard] Cleaning up ${globalPaths.length} global telemetry nodes...`);
-  await Promise.allSettled(globalPaths.map(path => remove(ref(database!, path))));
-
-  // 4. Force local cache update
-  const current = loadLocalDevices(parent.uid);
-  const updated = current.filter(d => 
-    String(d.pairingCode).toUpperCase() !== cleanCode && 
-    !targetIds.has(d.childId)
-  );
-  saveLocalDevices(parent.uid, updated);
-  
-  console.log(`[KidGuard] deleteChildDevice: Cleanup finished for ${cleanCode}`);
 };
 
 /**
@@ -1872,6 +1873,44 @@ export const clearAllParentDevices = async (): Promise<void> => {
 };
 
 /**
+ * Robust console reset that scans the global /devices node to ensure no orphan records 
+ * matching this parentUid remain. Also clears local storage and reloads.
+ */
+export const handleResetConsoleData = async (parentUid: string) => {
+  if (!database) return;
+  
+  try {
+    const devicesRef = ref(database, 'devices');
+    const snapshot = await get(devicesRef);
+    
+    if (snapshot.exists()) {
+      const updates: { [key: string]: null } = {};
+      snapshot.forEach((childSnapshot) => {
+        const deviceData = childSnapshot.val();
+        if (deviceData.parentUid === parentUid) {
+          updates[`devices/${childSnapshot.key}`] = null;
+          updates[`pairings/${childSnapshot.key}`] = null;
+          updates[`control/${childSnapshot.key}`] = null;
+        }
+      });
+      
+      if (Object.keys(updates).length > 0) {
+        await update(ref(database), updates);
+      }
+    }
+
+    // Also wipe the parent's primary children list
+    await remove(ref(database, `parents/${parentUid}/children`));
+    
+    localStorage.clear();
+    // We leave the reload to the caller or handled separately
+  } catch (error) {
+    console.error("Error resetting console data:", error);
+    throw error;
+  }
+};
+
+/**
  * Legacy wrapper for deleteChildDevice to maintain backward compatibility.
  */
 export const unlinkChildDevice = async (parentUid: string, childId: string): Promise<void> => {
@@ -1900,12 +1939,13 @@ export const sendRemoteCommand = async (
   fields: Record<string, any> = {}
 ): Promise<void> => {
   const commandId = `${Date.now()}_${parentUid}`;
-  const payload: RemoteCommand = {
+  const payload: any = {
     deviceId,
     parentUid,
     childId,
     commandId,
     command,
+    acknowledged: false, // Ensure the child listener triggers
     requestedBy: parentUid,
     requestedAt: Date.now(),
     ...fields,
