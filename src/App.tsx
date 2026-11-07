@@ -527,7 +527,9 @@ export const App: React.FC = () => {
           },
           onError: (err) => {
             if (isMounted) {
-              setChildStreamStatus(`Error: ${err.message}`);
+              const friendlyMsg = err.name === 'NotAllowedError' ? 'Camera/Mic access denied' : err.message;
+              setChildStreamStatus(`Error: ${friendlyMsg}`);
+              showToast(`Hardware Error: ${friendlyMsg}`);
               setCameraStreamActive(false);
             }
           }
@@ -574,7 +576,9 @@ export const App: React.FC = () => {
           },
           onError: (err) => {
             if (isMounted) {
-              setChildScreenStatus(`Error: ${err.message}`);
+              const friendlyMsg = err.name === 'NotAllowedError' ? 'Screen sharing denied' : err.message;
+              setChildScreenStatus(`Error: ${friendlyMsg}`);
+              showToast(`Screen Error: ${friendlyMsg}`);
               setScreenMirrorActive(false);
             }
           }
@@ -1239,19 +1243,28 @@ export const App: React.FC = () => {
                 <span className="text-blue-600">ACTIVE</span>
               </div>
 
+              {childStreamStatus.toLowerCase().includes('denied') && (
+                <div className="w-full p-4 mb-4 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs text-left">
+                  <p className="font-bold mb-1">Access Denied</p>
+                  <p>Browser is blocking the camera. Please click the <b>Lock/Settings icon</b> in your browser address bar, reset permissions, and refresh the page.</p>
+                </div>
+              )}
               <button 
                 onClick={async () => {
                   try {
                     await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    setChildStreamStatus('Access active');
                     showToast('Permissions granted!');
                   } catch (err: any) {
                     console.warn('Manual permission grant failed:', err);
+                    const friendlyMsg = err.name === 'NotAllowedError' ? 'Permission denied' : err.message;
+                    setChildStreamStatus(`Error: ${friendlyMsg}`);
                     if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
                       showToast('Permission denied. Please click the Lock icon in address bar to reset.');
                     } else if (err.name === 'SecurityError' || err.message?.includes('policy')) {
-                      showToast('Browser policy restricted. Please use a regular browser window.');
+                      showToast('Browser policy restricted.');
                     } else {
-                      showToast('Permission request failed. Check browser settings.');
+                      showToast(`Error: ${friendlyMsg}`);
                     }
                   }
                 }}
