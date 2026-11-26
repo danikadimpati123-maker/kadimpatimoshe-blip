@@ -7,8 +7,7 @@ import {
   Battery, 
   BatteryCharging, 
   CheckCircle2, 
-  Clock, 
-  ExternalLink 
+  Clock 
 } from 'lucide-react';
 import { ParentChildDevice } from '../types';
 
@@ -29,14 +28,56 @@ export const DeviceCard: React.FC<DeviceCardProps> = ({
   isSelected = false,
   onToggleSelection,
 }) => {
-  const modelName = device.deviceModelName || device.telemetry?.deviceModelName || `Device ${device.childId.slice(0, 8)}`;
-  const isOnline = device.isOnline;
+  // 1. మోడల్ నేమ్ కరెక్ట్గా పట్టుకోవడానికి అన్ని వేరియేషన్స్ చెక్ చేయడం
+  const rawModelName = 
+    device.deviceModelName || 
+    device.telemetry?.deviceModelName || 
+    (device as any).modelName || 
+    (device as any).deviceName || 
+    (device as any).name;
+
+  const modelName = (!rawModelName || rawModelName === 'Android' || rawModelName.startsWith('Android 1'))
+    ? `Device ${device.pairingCode || device.childId?.slice(0, 8) || 'Unknown'}`
+    : rawModelName;
+
+  const isOnline = device.isOnline ?? (device as any).online ?? false;
   const isPending = device.status === 'pending' || device.status === 'unpaired';
 
-  const formatLastSeen = (timestamp?: string | Date) => {
+  // 2. బ్యాటరీ మరియు ఛార్జింగ్ సేఫ్ రీడింగ్ (రూట్ లేదా టెలిమెట్రీ ఆబ్జెక్ట్ నుండి)
+  const batteryLevel = 
+    device.telemetry?.batteryLevel !== undefined 
+      ? device.telemetry.batteryLevel 
+      : (device as any).batteryLevel !== undefined 
+      ? (device as any).batteryLevel 
+      : (device as any).battery ?? 100;
+
+  const isCharging = 
+    device.telemetry?.isCharging !== undefined 
+      ? device.telemetry.isCharging 
+      : (device as any).isCharging ?? false;
+
+  // 3. లాస్ట్ హార్ట్బీట్ / లాస్ట్ సీన్ ఫార్మాటింగ్
+  const rawHeartbeat = 
+    device.lastHeartbeat || 
+    device.lastSeen || 
+    (device as any).timestamp || 
+    (device as any).updatedAt;
+
+  const formatLastSeen = (timestamp?: string | Date | number) => {
     if (!timestamp) return 'Recently';
     try {
-      const date = typeof timestamp === 'string' ? new Date(timestamp) : timestamp;
+      let date: Date;
+      if (timestamp instanceof Date) {
+        date = timestamp;
+      } else if (typeof timestamp === 'number') {
+        date = new Date(timestamp < 100000000000 ? timestamp * 1000 : timestamp);
+      } else if (/^\d+$/.test(timestamp.trim())) {
+        const num = Number(timestamp.trim());
+        date = new Date(num < 100000000000 ? num * 1000 : num);
+      } else {
+        date = new Date(timestamp);
+      }
+      if (isNaN(date.getTime())) return 'Recently';
       const diffMs = Date.now() - date.getTime();
       const diffMins = Math.floor(diffMs / 60000);
       if (diffMins < 1) return 'Just now';
@@ -76,11 +117,12 @@ export const DeviceCard: React.FC<DeviceCardProps> = ({
             <div className="w-11 h-11 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center shrink-0 border border-blue-100">
               <Smartphone className="w-5 h-5" />
             </div>
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <span className="block text-[10px] font-bold text-[#71807b] tracking-wider uppercase">
                 DEVICE MODEL NAME
               </span>
-              <h3 className="font-bold text-base text-[#202b29] truncate" title={modelName}>
+              {/* truncate తీసేసి full name లేదా wrap అయ్యేలా మార్చడం */}
+              <h3 className="font-bold text-sm text-[#202b29] break-words" title={modelName}>
                 {modelName}
               </h3>
             </div>
@@ -140,48 +182,26 @@ export const DeviceCard: React.FC<DeviceCardProps> = ({
             <span className="block text-[10px] font-bold text-[#71807b] uppercase">LAST HEARTBEAT</span>
             <span className="text-neutral-700 flex items-center gap-1">
               <Clock className="w-3 h-3 text-neutral-400" />
-              {isOnline ? 'Active now' : formatLastSeen(device.lastHeartbeat || device.lastSeen)}
+              {isOnline ? 'Active now' : formatLastSeen(rawHeartbeat)}
             </span>
           </div>
         </div>
 
         {/* Telemetry Summary & Counters Strip */}
-        <div className="bg-neutral-50 rounded-lg p-2.5 mb-4 border border-neutral-100 space-y-1.5 text-[11px]">
-          <div className="flex items-center justify-between text-neutral-600">
-            <div className="flex items-center gap-1.5 font-medium">
-              {device.telemetry?.isCharging ? (
-                <BatteryCharging className="w-3.5 h-3.5 text-emerald-600" />
+        <div className="bg-neutral-50 rounded-lg p-3 mb-4 border border-neutral-100 space-y-2 text-xs">
+          <div className="flex items-center justify-between gap-2 text-neutral-700">
+            <div className="flex items-center gap-1.5 font-medium shrink-0">
+              {isCharging ? (
+                <BatteryCharging className="w-4 h-4 text-emerald-600" />
               ) : (
-                <Battery className="w-3.5 h-3.5 text-neutral-500" />
+                <Battery className="w-4 h-4 text-neutral-500" />
               )}
-              <span>
-                {device.telemetry?.batteryLevel !== undefined
-                  ? `Battery: ${device.telemetry.batteryLevel}%`
-                  : 'Battery: Synced'}
-              </span>
-              <span className="ml-1 text-[9px] font-bold text-emerald-500 bg-emerald-50 px-1 rounded border border-emerald-100 uppercase tracking-tighter">
-                Live
-              </span>
+              <span>Battery: {batteryLevel}%</span>
             </div>
-            <span className="truncate max-w-[150px] text-neutral-500" title={device.location?.address || 'GPS Coordinates'}>
-              {device.location?.address
-                ? `📍 ${device.location.address.split(',')[0]}`
-                : device.location?.latitude !== undefined && device.location?.longitude !== undefined
-                ? `📍 ${device.location.latitude.toFixed(2)}°, ${device.location.longitude.toFixed(2)}°`
-                : '📍 GPS: Standby'}
-            </span>
-          </div>
-
-          {/* Quick telemetry counter pills */}
-          <div className="flex items-center gap-2 pt-1 border-t border-neutral-200/60 text-[10px] text-neutral-500 font-medium">
-            <span className="bg-white px-2 py-0.5 rounded border border-neutral-200">
-              📞 {Array.isArray(device.callLogs) ? device.callLogs.length : 0} calls
-            </span>
-            <span className="bg-white px-2 py-0.5 rounded border border-neutral-200">
-              📊 {Array.isArray(device.appUsage) ? device.appUsage.length : 0} apps
-            </span>
-            <span className="bg-white px-2 py-0.5 rounded border border-neutral-200">
-              🔔 {Array.isArray(device.notifications) ? device.notifications.length : 0} alerts
+            
+            <span className="text-neutral-600 flex items-center gap-1 text-[11px] shrink-0">
+              <Clock className="w-3.5 h-3.5 text-neutral-400" />
+              {isOnline ? 'Active now' : formatLastSeen(rawHeartbeat)}
             </span>
           </div>
         </div>

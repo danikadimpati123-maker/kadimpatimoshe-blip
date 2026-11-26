@@ -1,40 +1,57 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Shield, 
-  Smartphone, 
-  Battery, 
-  BatteryCharging, 
-  MapPin, 
-  ScreenShare, 
-  Video, 
-  Mic, 
-  Phone, 
-  Mail, 
-  Copy, 
-  Check, 
-  RefreshCw, 
-  Radio, 
+import React, { useState, useEffect, useRef, useMemo, useCallback, Component, ErrorInfo, ReactNode } from 'react';
+import {
+  Shield,
+  Smartphone,
+  ScreenShare,
+  Video,
+  Mic,
+  Phone,
+  Mail,
+  Copy,
+  Check,
+  RefreshCw,
+  Radio,
   Wifi,
-  ExternalLink,
-  Lock,
   Delete,
   ArrowRight,
   LogOut,
   Users,
   CheckCircle2,
   AlertCircle,
-  Sparkles,
-  Cast,
   Bell,
-  PhoneCall,
-  BarChart3,
-  Plus,
-  Loader2
+  Loader2,
+  Search,
+  Activity,
+  SwitchCamera
 } from 'lucide-react';
-import { auth, database, sanitizeForRTDB, subscribeToChildDevices, getCurrentParent, saveParentSession, clearParentSession, pairChildDevice, unlinkChildDevice, deleteChildDevice, clearAllParentDevices, handleResetConsoleData, signInWithEmail, signUpWithEmail, signOut as fbSignOut, onAuthStateChanged, getOrCreateChildPairingCode, sendEmailVerification } from './services/firebase';
+import {
+  auth,
+  database,
+  sanitizeForRTDB,
+  startHeartbeat,
+  pushData,
+  watchCmd,
+  ackCmd,
+  stopStreamNode,
+  subscribeToChildDevices,
+  subscribeToChildDeviceTelemetry,
+  saveParentSession,
+  pairChildDevice,
+  deleteChildDevice,
+  handleResetConsoleData,
+  signInWithEmail,
+  signUpWithEmail,
+  signOut as fbSignOut,
+  onAuthStateChanged,
+  getOrCreateChildPairingCode,
+  sendEmailVerification,
+  detectDeviceName,
+  syncDeviceName
+} from './services/firebase';
 import { startChildWebRTCSession, startChildScreenShareSession } from './services/webrtc';
-import { ref, update, onValue, off, set, onDisconnect, get } from 'firebase/database';
-import { ParentChildDevice, ConsoleNavSection } from './types';
+import { pushNotif } from './services/notifPipeline';
+import { ref, update, set, onDisconnect, get } from 'firebase/database';
+import { ParentChildDevice, ConsoleNavSection, DeviceTelemetryData } from './types';
 import { Header } from './components/Header';
 import { Sidebar } from './components/Sidebar';
 import { DeviceCard } from './components/DeviceCard';
@@ -49,139 +66,315 @@ import { AuthModal } from './components/AuthModal';
 
 type AppRole = 'parent' | 'child' | null;
 
-export const App: React.FC = () => {
+export type RemoteControlCommand =
+  | 'startStream'
+  | 'stopStream'
+  | 'startScreenShare'
+  | 'stopScreenShare'
+  | 'startAudio'
+  | 'stopAudio'
+  | 'switchCamera';
+
+export const sendRemoteControlCommand = async (
+  pairingCode: string,
+  command: RemoteControlCommand,
+  parentUid: string,
+  extraPayload?: Record<string, any>
+) => {
+  if (!database || !pairingCode) return;
+  const code = pairingCode.trim().toUpperCase();
+  const controlRef = ref(database, `devices/${code}/control`);
+  const commandId = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+  await update(controlRef, {
+    cmd: command,
+    command,
+    id: commandId,
+    commandId,
+    ...(extraPayload || {}),
+    sentBy: parentUid,
+    ack: false,
+    acknowledged: false,
+    requestedAt: Date.now(),
+  });
+};
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  message: string;
+}
+
+class ConsoleErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false, message: '' };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, message: error.message || 'Unexpected UI error occurred.' };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[KidGuard ErrorBoundary]:', error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-[#F4F6F4] flex items-center justify-center p-4">
+          <div className="max-w-md w-full bg-white rounded-3xl border border-rose-200 p-6 shadow-lg text-center space-y-4">
+            <div className="w-12 h-12 rounded-2xl bg-rose-50 text-rose-600 flex items-center justify-center mx-auto">
+              <AlertCircle className="w-6 h-6" />
+            </div>
+            <h2 className="text-lg font-extrabold text-[#1D302B]">Console Recovery Mode</h2>
+            <p className="text-xs text-[#71807B]">{this.state.message}</p>
+            <button
+              onClick={() => {
+                this.setState({ hasError: false, message: '' });
+                window.location.reload();
+              }}
+              className="px-4 py-2 rounded-xl bg-[#0A9B70] text-white text-xs font-bold hover:bg-[#087957] transition-colors"
+            >
+              Reload Console
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const generatePairingCode = (): string => {
+  const chars = '0123456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return `FG-${code}`;
+};
+
+const normalizeDeviceCode = (dev: ParentChildDevice): string =>
+  (dev.pairingCode || dev.childId?.replace(/^child_|^dev_/, '') || dev.deviceId || '')
+    .trim()
+    .toUpperCase();
+
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }],
+};
+
+const AppContent: React.FC = () => {
   // ----------------------------------------------------
   // Authentication & Onboarding State
   // ----------------------------------------------------
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [isAuthLoading, setIsAuthLoading] = useState<boolean>(true);
+  const [isAuthSubmitting, setIsAuthSubmitting] = useState<boolean>(false);
   const [currentUser, setCurrentUser] = useState<{ uid: string; email: string } | null>(null);
 
-  // Role Selection State
   const [selectedRole, setSelectedRole] = useState<AppRole>(() => {
-    return (localStorage.getItem('kidguard_device_role') as AppRole) || null;
+    const saved = localStorage.getItem('kidguard_device_role');
+    return saved === 'parent' || saved === 'child' ? saved : null;
   });
   const [rememberRole, setRememberRole] = useState<boolean>(true);
 
-  // Auth Mode State
-  const [authMode, setAuthMode] = useState<'email'>('email');
-  const [enteredPin, setEnteredPin] = useState<string>('');
-  const [passcodeError, setPasscodeError] = useState<string | null>(null);
   const [emailInput, setEmailInput] = useState<string>('');
   const [passwordInput, setPasswordInput] = useState<string>('');
+  const [passcodeError, setPasscodeError] = useState<string | null>(null);
   const [isRegistering, setIsRegistering] = useState<boolean>(false);
   const [verificationSent, setVerificationSent] = useState<boolean>(false);
 
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const showToast = (msg: string) => {
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
-    setTimeout(() => {
-      setToastMessage((prev) => (prev === msg ? null : prev));
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => {
+      setToastMessage(null);
     }, 3200);
-  };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, []);
 
   // ----------------------------------------------------
   // Parent Console State
   // ----------------------------------------------------
   const [currentSection, setCurrentSection] = useState<ConsoleNavSection>('devices');
   const [devices, setDevices] = useState<ParentChildDevice[]>([]);
-  const [selectedDevice, setSelectedDevice] = useState<ParentChildDevice | null>(null);
+  const [telemetryByCode, setTelemetryByCode] = useState<Record<string, DeviceTelemetryData>>({});
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState<string>('');
   const [isAddChildModalOpen, setIsAddChildModalOpen] = useState<boolean>(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
   const [activeStreamingDevice, setActiveStreamingDevice] = useState<ParentChildDevice | null>(null);
   const [selectedChildIds, setSelectedChildIds] = useState<string[]>([]);
   const [isBulkDeleting, setIsBulkDeleting] = useState<boolean>(false);
+  const hasAutoOpenedAddModalRef = useRef<boolean>(false);
 
-  const toggleDeviceSelection = (device: ParentChildDevice) => {
-    setSelectedChildIds(prev => 
-      prev.includes(device.childId) 
-        ? prev.filter(id => id !== device.childId) 
-        : [...prev, device.childId]
+  const liveDevices = useMemo<ParentChildDevice[]>(() => {
+    return devices.map((dev) => {
+      const code = normalizeDeviceCode(dev);
+      const live = code ? telemetryByCode[code] : undefined;
+      if (!live) return dev;
+
+      const mergedTelemetry = {
+        ...(dev.telemetry || {}),
+        ...(live.telemetry || {}),
+        deviceModelName:
+          live.telemetry?.deviceModelName ||
+          live.deviceModelName ||
+          dev.telemetry?.deviceModelName ||
+          dev.deviceModelName,
+        batteryLevel:
+          live.telemetry?.batteryLevel !== undefined
+            ? live.telemetry.batteryLevel
+            : dev.telemetry?.batteryLevel,
+        isCharging:
+          live.telemetry?.isCharging !== undefined
+            ? live.telemetry.isCharging
+            : dev.telemetry?.isCharging,
+        updatedAt: live.telemetry?.updatedAt || Date.now(),
+      };
+
+      const mergedPresence = {
+        ...(dev.presence || {}),
+        ...(live.presence || {}),
+        online: live.isOnline ?? live.presence?.online ?? dev.presence?.online ?? dev.isOnline,
+        heartbeatAt: live.lastHeartbeat || live.presence?.heartbeatAt || dev.presence?.heartbeatAt,
+        lastSeen: live.lastSeen || live.presence?.lastSeen || dev.presence?.lastSeen,
+      };
+
+      return {
+        ...dev,
+        isOnline: live.isOnline ?? dev.isOnline,
+        deviceModelName:
+          live.deviceModelName ||
+          live.telemetry?.deviceModelName ||
+          dev.deviceModelName,
+        platform: live.platform || dev.platform,
+        appState: live.appState || dev.appState,
+        lastHeartbeat: live.lastHeartbeat || live.presence?.heartbeatAt || dev.lastHeartbeat,
+        lastSeen: live.lastSeen || live.presence?.lastSeen || dev.lastSeen,
+        presence: mergedPresence,
+        telemetry: mergedTelemetry,
+        location: live.location || dev.location,
+        callLogs: live.callLogs && live.callLogs.length > 0 ? live.callLogs : dev.callLogs,
+        appUsage: live.appUsage && live.appUsage.length > 0 ? live.appUsage : dev.appUsage,
+        notifications: live.notifications && live.notifications.length > 0 ? live.notifications : dev.notifications,
+      };
+    });
+  }, [devices, telemetryByCode]);
+
+  const filteredDevices = useMemo<ParentChildDevice[]>(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return liveDevices;
+    return liveDevices.filter(
+      (d) =>
+        (d.deviceModelName || '').toLowerCase().includes(q) ||
+        (d.pairingCode || '').toLowerCase().includes(q) ||
+        (d.childId || '').toLowerCase().includes(q)
     );
-  };
+  }, [liveDevices, searchQuery]);
 
-  const handleSelectAll = () => {
-    if (selectedChildIds.length === devices.length) {
-      setSelectedChildIds([]);
-    } else {
-      setSelectedChildIds(devices.map(d => d.childId));
-    }
-  };
+  const selectedDevice = useMemo<ParentChildDevice | null>(() => {
+    if (liveDevices.length === 0) return null;
+    if (!selectedDeviceId) return liveDevices[0];
+    return liveDevices.find((d) => d.childId === selectedDeviceId) || liveDevices[0];
+  }, [liveDevices, selectedDeviceId]);
 
-  const handleBulkDelete = async () => {
+  const setSelectedDevice = useCallback((device: ParentChildDevice | null) => {
+    setSelectedDeviceId(device ? device.childId : null);
+  }, []);
+
+  const toggleDeviceSelection = useCallback((device: ParentChildDevice) => {
+    setSelectedChildIds((prev) =>
+      prev.includes(device.childId) ? prev.filter((id) => id !== device.childId) : [...prev, device.childId]
+    );
+  }, []);
+
+  const handleSelectAll = useCallback(() => {
+    setSelectedChildIds((prev) =>
+      prev.length === filteredDevices.length && filteredDevices.length > 0
+        ? []
+        : filteredDevices.map((d) => d.childId)
+    );
+  }, [filteredDevices]);
+
+  const handleBulkDelete = useCallback(async () => {
     if (selectedChildIds.length === 0) return;
     setIsBulkDeleting(true);
     let successCount = 0;
     let failCount = 0;
 
     try {
-      // Process all deletions in parallel for better performance
-      const results = await Promise.all(
+      await Promise.all(
         selectedChildIds.map(async (childId) => {
-          const device = devices.find(d => d.childId === childId);
-          if (device) {
-            const success = await deleteChildDevice(device.pairingCode || device.deviceId || childId, childId);
-            if (success) {
-              successCount++;
-            } else {
-              failCount++;
-            }
-            return success;
+          const device = liveDevices.find((d) => d.childId === childId);
+          if (!device) {
+            failCount++;
+            return;
           }
-          failCount++;
-          return false;
+          const ok = await deleteChildDevice(
+            device.pairingCode || device.deviceId || childId,
+            childId,
+            currentUser?.uid
+          );
+          if (ok) successCount++;
+          else failCount++;
         })
       );
 
       if (failCount > 0) {
-        alert(`డివైజ్ డిలీట్ కాలేదు. ఒకసారి కన్సోల్ ఎర్రర్స్ చెక్ చేయండి. (${successCount} success, ${failCount} failed)`);
+        showToast(`Deleted ${successCount}, failed ${failCount}. Check console logs.`);
       } else {
-        showToast(`Successfully deleted ${successCount} device(s).`);
-        console.log("Devices removed from UI successfully");
+        showToast(`Deleted ${successCount} device(s).`);
       }
-      setSelectedChildIds([]);
+      setSelectedChildIds((prev) => prev.filter((id) => !selectedChildIds.includes(id)));
     } catch (err: any) {
-      showToast(`Bulk operation failed: ${err.message}`);
+      showToast(`Bulk delete error: ${err.message}`);
     } finally {
       setIsBulkDeleting(false);
     }
-  };
+  }, [selectedChildIds, liveDevices, currentUser?.uid, showToast]);
 
-  const handleClearAllDevices = async () => {
+  const handleClearAllDevices = useCallback(async () => {
     if (!currentUser) return;
-    
     try {
       await handleResetConsoleData(currentUser.uid);
-      showToast("Account reset successfully. Reloading...");
-      setTimeout(() => window.location.reload(), 1500);
+      setDevices([]);
+      setTelemetryByCode({});
+      setSelectedChildIds([]);
+      showToast('Account reset successfully.');
     } catch (err: any) {
       showToast(`Reset failed: ${err.message}`);
     }
-  };
+  }, [currentUser, showToast]);
 
   // ----------------------------------------------------
   // Child Protection Client State
   // ----------------------------------------------------
-  const deviceName = "Child Device";
-  const deviceModel = "Android 14 (API 34) Protection Client";
-  const generateFlashGetCode = () => {
-    const chars = '0123456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-    let res = '';
-    for (let i = 0; i < 6; i++) res += chars.charAt(Math.floor(Math.random() * chars.length));
-    return `FG-${res}`;
-  };
-  const [pairingCode, setPairingCode] = useState<string>(() => generateFlashGetCode());
+  const detectedDeviceName = useMemo(() => detectDeviceName(), []);
+  const deviceName = detectedDeviceName;
+  const deviceModel = detectedDeviceName;
+  const [pairingCode, setPairingCode] = useState<string>('');
   const [copied, setCopied] = useState<boolean>(false);
+  const lastTelemetryPushRef = useRef<number>(0);
 
-  // Dynamic Battery Telemetry
-  const [batteryLevel, setBatteryLevel] = useState<number>(0);
+  const childHardwareId = useMemo(() => {
+    return currentUser?.uid ? `dev_${currentUser.uid.slice(0, 8)}` : `dev_${pairingCode}`;
+  }, [currentUser?.uid, pairingCode]);
+
+  const childRecordId = useMemo(() => `child_${childHardwareId}`, [childHardwareId]);
+
+  const [batteryLevel, setBatteryLevel] = useState<number>(100);
   const [isCharging, setIsCharging] = useState<boolean>(false);
-  const [batteryHealth] = useState<string>("Normal (Hardware Sensor)");
-  const [batteryTemp, setBatteryTemp] = useState<number>(25.0);
-  const [batteryVoltage] = useState<number>(3.80);
+  const batteryHealth = 'Normal (Hardware Sensor)';
+  const batteryTemp = 25.0;
+  const batteryVoltage = 3.8;
 
-  // Dynamic GPS Telemetry
   const [location, setLocation] = useState<{
     latitude: number;
     longitude: number;
@@ -197,515 +390,730 @@ export const App: React.FC = () => {
     address: 'Awaiting hardware GPS fix…',
     timestamp: Date.now(),
   });
-  const [isRefreshingGps, setIsRefreshingGps] = useState<boolean>(false);
 
-  // Active Background Services Toggles
+  // Streaming & Hardware Refs
   const [screenMirrorActive, setScreenMirrorActive] = useState<boolean>(false);
-  const [screenFps] = useState<number>(12);
-  const [screenFrameCount, setScreenFrameCount] = useState<number>(0);
+  const screenFps = 12;
   const [cameraStreamActive, setCameraStreamActive] = useState<boolean>(false);
+  const [cameraFacing, setCameraFacing] = useState<'environment' | 'user'>('environment');
   const [audioStreamActive, setAudioStreamActive] = useState<boolean>(false);
+  const [audioSignalingStatus, setAudioSignalingStatus] = useState<string>('');
+
   const childVideoPreviewRef = useRef<HTMLVideoElement>(null);
   const childScreenPreviewRef = useRef<HTMLVideoElement>(null);
+  const cameraPeerRef = useRef<RTCPeerConnection | null>(null);
+  const cameraVideoSenderRef = useRef<RTCRtpSender | null>(null);
+  const childCameraStreamRef = useRef<MediaStream | null>(null);
+  const isSwitchingCameraRef = useRef<boolean>(false);
+
+  const childAudioStreamRef = useRef<MediaStream | null>(null);
+  const audioPeerRef = useRef<RTCPeerConnection | null>(null);
+
   const [childStreamStatus, setChildStreamStatus] = useState<string>('');
   const [childScreenStatus, setChildScreenStatus] = useState<string>('');
-  
-  // Tracking which parent has claimed this child
-  const [parentLink, setParentLink] = useState<{ parentUid: string; childId: string } | null>(null);
 
-  // New effect to handle persistent pairing code in child mode
   useEffect(() => {
     if (selectedRole === 'child' && currentUser && auth) {
-      const fetchPersistentCode = async () => {
-        const code = await getOrCreateChildPairingCode(currentUser.uid, `dev_${currentUser.uid.slice(0, 8)}`, deviceModel);
-        if (code) {
-          setPairingCode((prev) => (prev === code ? prev : code));
-        }
-      };
-      fetchPersistentCode();
+      getOrCreateChildPairingCode(currentUser.uid, childHardwareId, deviceModel).then((code) => {
+        const finalCode = code || generatePairingCode();
+        setPairingCode(finalCode);
+        syncDeviceName(finalCode, deviceModel).catch(() => {});
+      });
     }
-  }, [selectedRole, currentUser?.uid]);
+  }, [selectedRole, currentUser?.uid, childHardwareId, deviceModel]);
 
-  const guardian = {
-    name: "Account Owner",
-    phone: "Linked",
-    email: currentUser?.email || 'kadimpatimoshe@gmail.com',
-    relationship: "Primary Guardian",
-    status: "Verified Account • Auto-Synced",
-  };
+  useEffect(() => {
+    if (selectedRole === 'child' && pairingCode) {
+      syncDeviceName(pairingCode, deviceModel).catch(() => {});
+    }
+  }, [selectedRole, pairingCode, deviceModel]);
+
+  const guardian = useMemo(
+    () => ({
+      name: 'Account Owner',
+      phone: 'Linked',
+      email: currentUser?.email || 'kadimpatimoshe@gmail.com',
+      relationship: 'Primary Guardian',
+      status: 'Verified Account • Auto-Synced',
+    }),
+    [currentUser?.email]
+  );
 
   // ----------------------------------------------------
-  // Authentication & Onboarding Lifecycle
+  // Auth Lifecycle
   // ----------------------------------------------------
   useEffect(() => {
-    // Listen for real-time Firebase Auth state changes for permanent persistence
     if (!auth) {
       setIsAuthLoading(false);
       return;
     }
-    
+
     const unsubscribe = onAuthStateChanged(auth, (user: any) => {
       if (user) {
         const sessionUser = { uid: user.uid, email: user.email || '' };
         saveParentSession(sessionUser);
-        setCurrentUser((prev) => {
-          if (prev?.uid === sessionUser.uid && prev?.email === sessionUser.email) return prev;
-          return sessionUser;
-        });
-        setIsAuthenticated(prev => prev === true ? prev : true);
+        setCurrentUser(sessionUser);
+        setIsAuthenticated(true);
       } else {
         setCurrentUser(null);
-        setIsAuthenticated(prev => prev === false ? prev : false);
+        setIsAuthenticated(false);
       }
-      setIsAuthLoading(prev => prev === false ? prev : false);
+      setIsAuthLoading(false);
     });
 
     return () => unsubscribe();
   }, []);
 
   // ----------------------------------------------------
-  // Sync Devices for Parent Console
+  // Parent Device & Live Telemetry Subscriptions
   // ----------------------------------------------------
   useEffect(() => {
     if (selectedRole !== 'parent' || !currentUser) return;
-
-    const unsubscribe = subscribeToChildDevices(currentUser.uid, (updatedDevices) => {
-      setDevices((prev) => {
-        // Deep equality check to prevent reference-only updates from triggering re-renders
-        if (JSON.stringify(prev) === JSON.stringify(updatedDevices)) return prev;
-        return updatedDevices;
-      });
-
-      setSelectedDevice((prev) => {
-        if (!updatedDevices || updatedDevices.length === 0) return null;
-        
-        // If no device currently selected, pick the first one
-        if (!prev) return updatedDevices[0];
-        
-        // Find the same device in the updated list
-        const matching = updatedDevices.find((d) => d.childId === prev.childId);
-        
-        // If the selected device was removed, pick the first one
-        if (!matching) return updatedDevices[0];
-        
-        // Only update if data actually changed to avoid reference-only re-renders
-        if (JSON.stringify(matching) === JSON.stringify(prev)) return prev;
-        return matching;
-      });
-    });
-
-    return () => {
-      unsubscribe();
-    };
+    const unsubscribe = subscribeToChildDevices(currentUser.uid, (list) =>
+      setDevices(
+        (list || []).filter(
+          (d) =>
+            d &&
+            d.status !== 'deleted' &&
+            d.status !== 'unpaired' &&
+            d.isPaired !== false &&
+            /^FG-/.test(String(d.pairingCode || '').trim().toUpperCase())
+        )
+      )
+    );
+    return () => unsubscribe();
   }, [selectedRole, currentUser?.uid]);
 
-  // Auto-open Add Child Modal if no devices are linked (Onboarding)
   useEffect(() => {
-    if (selectedRole === 'parent' && isAuthenticated && devices.length === 0) {
-      setIsAddChildModalOpen(prev => prev === true ? prev : true);
+    if (selectedRole !== 'parent' || devices.length === 0) {
+      setTelemetryByCode({});
+      return;
     }
-  }, [selectedRole, isAuthenticated, devices.length]);
+
+    const codes = Array.from(new Set(devices.map(normalizeDeviceCode).filter(Boolean)));
+
+    const unsubs = codes.map((code) =>
+      subscribeToChildDeviceTelemetry(code, (data) => {
+        setTelemetryByCode((prev) => {
+          if (!data) {
+            if (!(code in prev)) return prev;
+            const next = { ...prev };
+            delete next[code];
+            return next;
+          }
+          return { ...prev, [code]: data };
+        });
+      })
+    );
+
+    return () => unsubs.forEach((u) => u());
+  }, [selectedRole, devices]);
+
+  useEffect(() => {
+    if (
+      selectedRole === 'parent' &&
+      isAuthenticated &&
+      liveDevices.length === 0 &&
+      !hasAutoOpenedAddModalRef.current
+    ) {
+      hasAutoOpenedAddModalRef.current = true;
+      setIsAddChildModalOpen(true);
+    }
+  }, [selectedRole, isAuthenticated, liveDevices.length]);
 
   // ----------------------------------------------------
-  // Child Device: Presence Logic (Online/Offline)
+  // Child + Parent onDisconnect Presence & Heartbeat
   // ----------------------------------------------------
   useEffect(() => {
     if (selectedRole !== 'child' || !database || !pairingCode) return;
 
-    const presenceRef = ref(database, `devices/${pairingCode}/presence/online`);
-    
-    // Set to true when the component mounts (online)
-    set(presenceRef, true);
-    
-    // Set to false when the connection is lost or the app is closed
-    onDisconnect(presenceRef).set(false);
+    const stopBeat = startHeartbeat(pairingCode);
+    const devicePresenceRef = ref(database, `devices/${pairingCode}/presence/online`);
+    set(devicePresenceRef, true).catch(() => {});
+    onDisconnect(devicePresenceRef).set(false).catch(() => {});
 
-    // Also update parent console sync if logged in
-    if (currentUser) {
-      const childId = `browser_${currentUser.uid.slice(0, 8)}`;
-      const parentPresenceRef = ref(database, `parents/${currentUser.uid}/children/${childId}/presence/online`);
-      set(parentPresenceRef, true);
-      onDisconnect(parentPresenceRef).set(false);
-    }
-  }, [selectedRole, pairingCode, currentUser?.uid]);
+    let parentPresenceRef: ReturnType<typeof ref> | null = null;
+    let active = true;
 
-  // ----------------------------------------------------
-  // Child Device: Battery & GPS Telemetry Push to RTDB
-  // ----------------------------------------------------
-  useEffect(() => {
-    // Child-to-Parent Direct Sync Logic
-    // Only perform direct sync if the child device is legitimately linked in RTDB
-    const checkAndSync = async () => {
+    const bindParentPresence = async () => {
       try {
-        const deviceRef = ref(database!, `devices/${pairingCode}`);
+        const snap = await get(ref(database!, `devices/${pairingCode}`));
+        const deviceData = snap.val();
+        const targetParentUid = deviceData?.parentUid || currentUser?.uid;
+        if (!active || !targetParentUid) return;
+
+        let resolvedChildId = deviceData?.childId || childRecordId;
+        const childrenSnap = await get(ref(database!, `parents/${targetParentUid}/children`));
+        const childrenMap = childrenSnap.val() || {};
+
+        const matchedEntry = Object.entries(childrenMap).find(([key, val]: [string, any]) => {
+          const codeMatch = (val?.pairingCode || '').toUpperCase() === pairingCode.toUpperCase();
+          const idMatch = key === resolvedChildId || val?.childId === resolvedChildId;
+          return codeMatch || idMatch;
+        });
+
+        if (matchedEntry) {
+          resolvedChildId = matchedEntry[0];
+        }
+
+        if (!active || !resolvedChildId) return;
+
+        parentPresenceRef = ref(
+          database!,
+          `parents/${targetParentUid}/children/${resolvedChildId}/presence/online`
+        );
+        await set(parentPresenceRef, true);
+        await onDisconnect(parentPresenceRef).set(false);
+      } catch (err) {
+        console.warn('[KidGuard] Parent presence binding skip:', err);
+      }
+    };
+
+    bindParentPresence();
+
+    return () => {
+      active = false;
+      stopBeat();
+      set(devicePresenceRef, false).catch(() => {});
+      if (parentPresenceRef) {
+        set(parentPresenceRef, false).catch(() => {});
+      }
+    };
+  }, [selectedRole, pairingCode, currentUser?.uid, childRecordId]);
+
+  // ----------------------------------------------------
+  // Event Sync (4s throttle) + Steady 20s Heartbeat via syncChildTelemetryRef
+  // ----------------------------------------------------
+  const syncChildTelemetry = useCallback(
+    async (force = false) => {
+      if (selectedRole !== 'child' || !database || !pairingCode) return;
+
+      const now = Date.now();
+      if (!force && now - lastTelemetryPushRef.current < 4000) return;
+      lastTelemetryPushRef.current = now;
+
+      try {
+        const deviceRef = ref(database, `devices/${pairingCode}`);
         const snap = await get(deviceRef);
         const data = snap.val();
-        
-        // If the device record is gone or unlinked, DO NOT re-create it.
-        // This prevents "Zombie Re-sync" where a deleted device keeps coming back.
+
         if (!data || data.status === 'unpaired' || data.status === 'deleted' || !data.parentUid || data.isPaired === false) {
-          console.debug(`[KidGuard] Skipping sync for unlinked device.`);
           return;
         }
 
+        const nowTs = Date.now();
+        const nowIso = new Date(nowTs).toISOString();
+        const targetChildId = data.childId || childRecordId;
+
         const payload = sanitizeForRTDB({
+          deviceId: childHardwareId,
+          childId: targetChildId,
           deviceName,
           deviceModelName: deviceModel,
           pairingCode,
           status: 'active',
           platform: 'android',
-          lastHeartbeat: Date.now(),
+          online: true,
+          isOnline: true,
+          ts: nowTs,
+          lastHeartbeat: nowTs,
+          lastSeen: nowIso,
           telemetry: {
+            deviceModelName: deviceModel,
+            platform: 'android',
+            appState: document.visibilityState === 'visible' ? 'resumed' : 'background',
             batteryLevel,
             isCharging,
             batteryTemp,
             batteryVoltage,
             batteryHealth,
-            updatedAt: Date.now(),
+            updatedAt: nowTs,
           },
-          location: {
-            latitude: location.latitude,
-            longitude: location.longitude,
-            speed: location.speed,
-            accuracy: location.accuracy,
-            address: location.address,
-            timestamp: location.timestamp,
-          },
+          location,
           presence: {
             online: true,
-            heartbeatAt: Date.now(),
+            heartbeatAt: nowTs,
+            lastSeen: nowTs,
           },
           guardian,
         });
 
-        await update(ref(database!, `devices/${pairingCode}`), payload);
-        await update(ref(database!, `devices/${pairingCode}/telemetry/battery`), {
+        await update(ref(database, `devices/${pairingCode}`), payload);
+        await update(ref(database, `devices/${pairingCode}/telemetry/battery`), {
           level: batteryLevel,
           isCharging,
           temperature: batteryTemp,
           voltage: batteryVoltage,
           health: batteryHealth,
-          updatedAt: Date.now(),
+          updatedAt: nowTs,
         });
-        await update(ref(database!, `devices/${pairingCode}/location`), location);
+        await update(ref(database, `devices/${pairingCode}/location`), location);
 
-        // Also mirror to pure 4-digit code if code has letters/hyphen (e.g. 8492)
-        const numCode = pairingCode.replace(/\D/g, '');
-        if (numCode && numCode !== pairingCode) {
-          await update(ref(database!, `devices/${numCode}`), payload);
-        }
-        
-        // Sync to parent console directly if linked or if using same account
-        if (currentUser) {
-          const childId = `child_dev_${currentUser.uid.slice(0, 8)}`; 
-          const parentDevicePath = `parents/${currentUser.uid}/children/${childId}`;
-          
-          await update(ref(database!, parentDevicePath), {
+        const parentUidToSync = data.parentUid || currentUser?.uid;
+        if (parentUidToSync) {
+          await update(ref(database, `parents/${parentUidToSync}/children/${targetChildId}`), {
             ...payload,
-            childId,
+            childId: targetChildId,
+            deviceId: childHardwareId,
             status: 'synced',
             isOnline: true,
-            lastSeen: new Date().toISOString(),
-          });
-          
-          setParentLink(prev => {
-            if (prev?.parentUid === currentUser.uid && prev?.childId === childId) return prev;
-            return { parentUid: currentUser.uid, childId };
+            lastSeen: nowIso,
           });
         }
       } catch (e) {
-        console.warn('Firebase RTDB child sync skip:', e);
+        console.warn('[KidGuard] RTDB telemetry sync skip:', e);
       }
-    };
+    },
+    [
+      selectedRole,
+      pairingCode,
+      childRecordId,
+      childHardwareId,
+      deviceName,
+      deviceModel,
+      batteryLevel,
+      isCharging,
+      batteryTemp,
+      batteryVoltage,
+      batteryHealth,
+      location,
+      guardian,
+      currentUser?.uid,
+    ]
+  );
 
-    checkAndSync();
-  }, [batteryLevel, isCharging, batteryTemp, location, pairingCode, selectedRole, currentUser?.uid]);
+  const syncChildTelemetryRef = useRef<((force?: boolean) => Promise<void>) | null>(null);
 
-  // Listen for parent remote commands in child mode
   useEffect(() => {
-    if (selectedRole !== 'child' && selectedRole !== null) return;
-    if (!database) return;
+    syncChildTelemetryRef.current = syncChildTelemetry;
+  }, [syncChildTelemetry]);
 
-    const controlRef = ref(database, `devices/${pairingCode}/control`);
-    const unsubscribe = onValue(controlRef, (snapshot) => {
-      const val = snapshot.val();
-      if (!val || val.acknowledged) return;
+  useEffect(() => {
+    if (selectedRole !== 'child') return;
+    void syncChildTelemetryRef.current?.(false);
+  }, [selectedRole, batteryLevel, isCharging, location?.timestamp]);
 
-      const cmd = val.command;
+  useEffect(() => {
+    if (selectedRole !== 'child') return;
+
+    void syncChildTelemetryRef.current?.(true);
+    const heartbeatTimer = window.setInterval(() => {
+      void syncChildTelemetryRef.current?.(true);
+    }, 20000);
+
+    return () => {
+      window.clearInterval(heartbeatTimer);
+    };
+  }, [selectedRole]);
+
+  const hasPushedActiveRef = useRef(false);
+
+  useEffect(() => {
+    if (selectedRole !== 'child' || !pairingCode || hasPushedActiveRef.current) return;
+    hasPushedActiveRef.current = true;
+    pushNotif(pairingCode, {
+      appName: 'KidGuard',
+      title: 'Protection Active',
+      text: `${deviceModel} connected`,
+      category: 'system',
+    });
+  }, [selectedRole, pairingCode, deviceModel]);
+
+  // ----------------------------------------------------
+  // Fast Camera Switch with replaceTrack & Error Rollback
+  // ----------------------------------------------------
+  const cleanupCameraHardware = useCallback(() => {
+    if (childCameraStreamRef.current) {
+      childCameraStreamRef.current.getTracks().forEach((track) => track.stop());
+      childCameraStreamRef.current = null;
+    }
+    cameraVideoSenderRef.current = null;
+    if (cameraPeerRef.current) {
+      cameraPeerRef.current.close();
+      cameraPeerRef.current = null;
+    }
+  }, []);
+
+  const handleSwitchCameraFast = useCallback(
+    async (targetFacing?: 'environment' | 'user') => {
+      if (isSwitchingCameraRef.current) return;
+      isSwitchingCameraRef.current = true;
+
+      const previousFacing: 'environment' | 'user' = cameraFacing;
+      const nextFacing: 'environment' | 'user' =
+        targetFacing || (previousFacing === 'environment' ? 'user' : 'environment');
+
+      setCameraFacing(nextFacing);
+      setChildStreamStatus(`Switching to ${nextFacing === 'user' ? 'Front' : 'Back'} camera…`);
+
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setCameraFacing(previousFacing);
+        showToast('Camera API unavailable');
+        isSwitchingCameraRef.current = false;
+        return;
+      }
+
+      try {
+        const nextStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: nextFacing } },
+          audio: false,
+        });
+
+        const nextVideoTrack = nextStream.getVideoTracks()[0];
+        if (!nextVideoTrack) {
+          nextStream.getTracks().forEach((t) => t.stop());
+          throw new Error('No video track found on selected camera');
+        }
+
+        const existingAudioTracks = childCameraStreamRef.current?.getAudioTracks() || [];
+        existingAudioTracks.forEach((audioTrack) => {
+          nextStream.addTrack(audioTrack);
+        });
+
+        const videoSender =
+          cameraVideoSenderRef.current ||
+          cameraPeerRef.current?.getSenders().find((s) => s.track?.kind === 'video') ||
+          null;
+
+        if (videoSender) {
+          await videoSender.replaceTrack(nextVideoTrack);
+          cameraVideoSenderRef.current = videoSender;
+        }
+
+        if (childVideoPreviewRef.current) {
+          childVideoPreviewRef.current.srcObject = nextStream;
+        }
+
+        if (childCameraStreamRef.current) {
+          childCameraStreamRef.current.getVideoTracks().forEach((track) => track.stop());
+        }
+        childCameraStreamRef.current = nextStream;
+
+        if (database && pairingCode) {
+          await update(ref(database, `devices/${pairingCode}/stream`), {
+            cameraFacing: nextFacing === 'user' ? 'front' : 'back',
+            updatedAt: Date.now(),
+          });
+        }
+
+        setChildStreamStatus(`Live (${nextFacing === 'user' ? 'Front Lens' : 'Back Lens'})`);
+        showToast(`Switched to ${nextFacing === 'user' ? 'Front' : 'Back'} Camera`);
+      } catch (err: any) {
+        setCameraFacing(previousFacing);
+
+        const friendly =
+          err?.name === 'NotAllowedError'
+            ? 'Camera access denied'
+            : err?.name === 'OverconstrainedError'
+            ? 'Requested lens not available on device'
+            : err?.message || 'Switch failed';
+
+        setChildStreamStatus(
+          `Error: ${friendly} (Kept ${previousFacing === 'user' ? 'Front' : 'Back'} Lens)`
+        );
+        showToast(`Camera Switch Error: ${friendly}`);
+      } finally {
+        isSwitchingCameraRef.current = false;
+      }
+    },
+    [cameraFacing, pairingCode, showToast]
+  );
+
+  // ----------------------------------------------------
+  // Unified WebRTC Audio Stream Signaling (via startChildWebRTCSession)
+  // ----------------------------------------------------
+  const cleanupAudioWebRTC = useCallback(() => {
+    if (audioPeerRef.current) {
+      audioPeerRef.current.onicecandidate = null;
+      audioPeerRef.current.onconnectionstatechange = null;
+      audioPeerRef.current.close();
+      audioPeerRef.current = null;
+    }
+    if (childAudioStreamRef.current) {
+      childAudioStreamRef.current.getTracks().forEach((t) => t.stop());
+      childAudioStreamRef.current = null;
+    }
+    setAudioSignalingStatus('');
+  }, []);
+
+  useEffect(() => {
+    if (selectedRole !== 'child' || !audioStreamActive || !pairingCode) {
+      cleanupAudioWebRTC();
+      return;
+    }
+
+    let isMounted = true;
+    let cleanupFn: (() => void) | null = null;
+
+    startChildWebRTCSession(pairingCode, {
+      mode: 'audio',
+      onStream: (stream) => {
+        childAudioStreamRef.current = stream;
+      },
+      onStatusChange: (status) => {
+        if (isMounted) setAudioSignalingStatus(status);
+      },
+      onError: (err) => {
+        if (!isMounted) return;
+        const friendly = err.name === 'NotAllowedError' ? 'Microphone access denied' : err.message;
+        setAudioSignalingStatus(`Error: ${friendly}`);
+        showToast(`Audio Error: ${friendly}`);
+        setAudioStreamActive(false);
+        cleanupAudioWebRTC();
+      },
+    })
+      .then((session) => {
+        if (!isMounted) {
+          session.cleanup();
+          return;
+        }
+        cleanupFn = session.cleanup;
+        audioPeerRef.current = session.peerConnection;
+      })
+      .catch((err: any) => {
+        if (!isMounted) return;
+        setAudioSignalingStatus(`Error: ${err.message}`);
+        setAudioStreamActive(false);
+        cleanupAudioWebRTC();
+      });
+
+    return () => {
+      isMounted = false;
+      cleanupFn?.();
+      cleanupAudioWebRTC();
+    };
+  }, [selectedRole, audioStreamActive, pairingCode, cleanupAudioWebRTC, showToast]);
+
+  // Remote Control Commands Listener (watchCmd + ackCmd)
+  useEffect(() => {
+    if (selectedRole !== 'child' || !pairingCode) return;
+
+    const unsubscribe = watchCmd(pairingCode, async (val) => {
+      const cmd = val.cmd || val.command;
+      if (!cmd) return;
+
       if (cmd === 'startScreenShare') {
+        setCameraStreamActive(false);
+        setAudioStreamActive(false);
         setScreenMirrorActive(true);
-        showToast('Parent requested Screen Mirroring start');
+        showToast('Parent started Screen Mirroring');
       } else if (cmd === 'stopScreenShare') {
         setScreenMirrorActive(false);
+        await stopStreamNode(pairingCode).catch(() => {});
         showToast('Screen Mirroring stopped');
-      } else if (cmd === 'startStream') {
+      } else if (cmd === 'startCamera' || cmd === 'startStream') {
+        setAudioStreamActive(false);
+        setScreenMirrorActive(false);
         setCameraStreamActive(true);
         showToast('Parent started Remote Camera stream');
       } else if (cmd === 'stopStream') {
         setCameraStreamActive(false);
-        showToast('Remote Camera stream stopped');
+        setAudioStreamActive(false);
+        setScreenMirrorActive(false);
+        await stopStreamNode(pairingCode).catch(() => {});
+        showToast('Live stream stopped');
+      } else if (cmd === 'startAudio') {
+        setCameraStreamActive(false);
+        setScreenMirrorActive(false);
+        setAudioStreamActive(true);
+        showToast('Parent started Live Audio stream');
+      } else if (cmd === 'stopAudio') {
+        setAudioStreamActive(false);
+        await stopStreamNode(pairingCode).catch(() => {});
+        showToast('Live Audio stream stopped');
+      } else if (cmd === 'switchCamera') {
+        const requestedFacing: 'environment' | 'user' | undefined =
+          val.cameraFacing === 'front' || val.cameraFacing === 'user'
+            ? 'user'
+            : val.cameraFacing === 'back' || val.cameraFacing === 'environment'
+            ? 'environment'
+            : undefined;
+        void handleSwitchCameraFast(requestedFacing);
       }
 
-      update(controlRef, {
-        acknowledged: true,
-        executedAt: Date.now(),
-      });
+      await ackCmd(pairingCode).catch(() => {});
     });
 
-    return () => {
-      off(controlRef);
-    };
-  }, [pairingCode, selectedRole]);
+    return () => unsubscribe();
+  }, [pairingCode, selectedRole, handleSwitchCameraFast, showToast]);
 
-  // Listen for pairing status to find parent UID for direct sync
+  // Hardware Battery API
   useEffect(() => {
-    if (selectedRole !== 'child' || !database) return;
-    const deviceRef = ref(database, `devices/${pairingCode}`);
-    const unsubscribe = onValue(deviceRef, (snapshot) => {
-      const data = snapshot.val();
-      if (data && data.parentUid && data.childId) {
-        setParentLink(prev => {
-          if (prev?.parentUid === data.parentUid && prev?.childId === data.childId) return prev;
-          return { parentUid: data.parentUid, childId: data.childId };
-        });
-      }
-    });
-    return () => off(deviceRef);
-  }, [pairingCode, selectedRole]);
+    if (selectedRole !== 'child' || !('getBattery' in navigator)) return;
 
-
-
-  // Real Hardware Battery API Listener
-  useEffect(() => {
-    if (selectedRole !== 'child') return;
     let batteryObj: any = null;
-    let onLevelChange: () => void;
-    let onChargingChange: () => void;
+    const handleLevel = () => setBatteryLevel(Math.round(batteryObj.level * 100));
+    const handleCharging = () => setIsCharging(Boolean(batteryObj.charging));
 
-    if ('getBattery' in navigator) {
-      (navigator as any).getBattery().then((bat: any) => {
+    (navigator as any)
+      .getBattery()
+      .then((bat: any) => {
         batteryObj = bat;
         setBatteryLevel(Math.round(bat.level * 100));
-        setIsCharging(bat.charging);
-
-        onLevelChange = () => setBatteryLevel(prev => {
-          const next = Math.round(bat.level * 100);
-          return prev === next ? prev : next;
-        });
-        onChargingChange = () => setIsCharging(bat.charging);
-
-        bat.addEventListener('levelchange', onLevelChange);
-        bat.addEventListener('chargingchange', onChargingChange);
-      }).catch(() => {});
-    }
+        setIsCharging(Boolean(bat.charging));
+        bat.addEventListener('levelchange', handleLevel);
+        bat.addEventListener('chargingchange', handleCharging);
+      })
+      .catch(() => {});
 
     return () => {
       if (batteryObj) {
-        batteryObj.removeEventListener('levelchange', onLevelChange);
-        batteryObj.removeEventListener('chargingchange', onChargingChange);
+        batteryObj.removeEventListener('levelchange', handleLevel);
+        batteryObj.removeEventListener('chargingchange', handleCharging);
       }
     };
   }, [selectedRole]);
 
-  // Child-side WebRTC Camera Stream Effect
+  // Child Camera WebRTC Session + Sender Binding
   useEffect(() => {
-    if (selectedRole !== 'child' || !cameraStreamActive || !pairingCode) return;
+    if (selectedRole !== 'child' || !cameraStreamActive || !pairingCode) {
+      cleanupCameraHardware();
+      return;
+    }
 
-    let isMounted = true;
-    let sessionCleanup: (() => void) | null = null;
+    let active = true;
+    let cleanupFn: (() => void) | null = null;
 
-    const runSession = async () => {
-      try {
-        const session = await startChildWebRTCSession(pairingCode, {
-          onStream: (stream) => {
-            if (isMounted && childVideoPreviewRef.current) {
-              childVideoPreviewRef.current.srcObject = stream;
-            }
-          },
-          onStatusChange: (status) => {
-            if (isMounted) setChildStreamStatus(status);
-          },
-          onError: (err) => {
-            if (isMounted) {
-              const friendlyMsg = err.name === 'NotAllowedError' ? 'Camera/Mic access denied' : err.message;
-              setChildStreamStatus(`Error: ${friendlyMsg}`);
-              showToast(`Hardware Error: ${friendlyMsg}`);
-              setCameraStreamActive(false);
-            }
-          }
-        });
-        
-        if (isMounted) {
-          sessionCleanup = session.cleanup;
-        } else {
-          session.cleanup();
+    startChildWebRTCSession(pairingCode, {
+      onStream: (stream) => {
+        childCameraStreamRef.current = stream;
+        if (active && childVideoPreviewRef.current) {
+          childVideoPreviewRef.current.srcObject = stream;
         }
-      } catch (err: any) {
-        if (isMounted) {
-          setChildStreamStatus(`Failed to start stream: ${err.message}`);
-          setCameraStreamActive(false);
+      },
+      onStatusChange: (status) => {
+        if (active) setChildStreamStatus(status);
+      },
+      onError: (err) => {
+        if (!active) return;
+        const friendly = err.name === 'NotAllowedError' ? 'Camera/Mic access denied' : err.message;
+        setChildStreamStatus(`Error: ${friendly}`);
+        showToast(`Camera Error: ${friendly}`);
+        setCameraStreamActive(false);
+        cleanupCameraHardware();
+      },
+    })
+      .then((session: any) => {
+        if (!active) {
+          session?.cleanup?.();
+          return;
         }
-      }
-    };
-
-    runSession();
+        cleanupFn = session?.cleanup || null;
+        if (session?.peerConnection) {
+          cameraPeerRef.current = session.peerConnection;
+          const vSender = session.peerConnection.getSenders().find((s: RTCRtpSender) => s.track?.kind === 'video');
+          if (vSender) cameraVideoSenderRef.current = vSender;
+        }
+      })
+      .catch((err: any) => {
+        if (!active) return;
+        setChildStreamStatus(`Failed to start stream: ${err.message}`);
+        setCameraStreamActive(false);
+        cleanupCameraHardware();
+      });
 
     return () => {
-      isMounted = false;
-      if (sessionCleanup) sessionCleanup();
+      active = false;
+      cleanupFn?.();
+      cleanupCameraHardware();
     };
-  }, [selectedRole, cameraStreamActive, pairingCode]);
+  }, [selectedRole, cameraStreamActive, pairingCode, cleanupCameraHardware, showToast]);
 
-  // Child-side WebRTC Screen Mirror Effect
+  // Child Screen Share WebRTC Session
   useEffect(() => {
     if (selectedRole !== 'child' || !screenMirrorActive || !pairingCode) return;
 
-    let isMounted = true;
-    let sessionCleanup: (() => void) | null = null;
+    let active = true;
+    let cleanupFn: (() => void) | null = null;
 
-    const runSession = async () => {
-      try {
-        const session = await startChildScreenShareSession(pairingCode, {
-          onStream: (stream) => {
-            if (isMounted && childScreenPreviewRef.current) {
-              childScreenPreviewRef.current.srcObject = stream;
-            }
-          },
-          onStatusChange: (status) => {
-            if (isMounted) setChildScreenStatus(status);
-          },
-          onError: (err) => {
-            if (isMounted) {
-              const friendlyMsg = err.name === 'NotAllowedError' ? 'Screen sharing denied' : err.message;
-              setChildScreenStatus(`Error: ${friendlyMsg}`);
-              showToast(`Screen Error: ${friendlyMsg}`);
-              setScreenMirrorActive(false);
-            }
-          }
-        });
-        
-        if (isMounted) {
-          sessionCleanup = session.cleanup;
-        } else {
-          session.cleanup();
+    startChildScreenShareSession(pairingCode, {
+      onStream: (stream) => {
+        if (active && childScreenPreviewRef.current) {
+          childScreenPreviewRef.current.srcObject = stream;
         }
-      } catch (err: any) {
-        if (isMounted) {
-          setChildScreenStatus(`Failed to start screen mirror: ${err.message}`);
-          setScreenMirrorActive(false);
-        }
-      }
-    };
-
-    runSession();
+      },
+      onStatusChange: (status) => {
+        if (active) setChildScreenStatus(status);
+      },
+      onError: (err) => {
+        if (!active) return;
+        const friendly = err.name === 'NotAllowedError' ? 'Screen sharing denied' : err.message;
+        setChildScreenStatus(`Error: ${friendly}`);
+        showToast(`Screen Error: ${friendly}`);
+        setScreenMirrorActive(false);
+      },
+    })
+      .then((session) => {
+        if (active) cleanupFn = session.cleanup;
+        else session.cleanup();
+      })
+      .catch((err: any) => {
+        if (!active) return;
+        setChildScreenStatus(`Failed to start screen mirror: ${err.message}`);
+        setScreenMirrorActive(false);
+      });
 
     return () => {
-      isMounted = false;
-      if (sessionCleanup) sessionCleanup();
+      active = false;
+      cleanupFn?.();
     };
-  }, [selectedRole, screenMirrorActive, pairingCode]);
+  }, [selectedRole, screenMirrorActive, pairingCode, showToast]);
 
-  // Real Hardware Geolocation API Listener
+  // Hardware Geolocation Listener
   useEffect(() => {
-    if (selectedRole !== 'child') return;
-    let watchId: number | null = null;
+    if (selectedRole !== 'child' || !('geolocation' in navigator)) return;
 
-    if ('geolocation' in navigator) {
-      watchId = navigator.geolocation.watchPosition(
-        (pos) => {
-          const lat = Number(pos.coords.latitude.toFixed(6));
-          const lon = Number(pos.coords.longitude.toFixed(6));
-          const acc = Math.round(pos.coords.accuracy || 5);
-          const spd = Number((pos.coords.speed ? pos.coords.speed * 3.6 : 0.0).toFixed(1));
-          const ts = pos.timestamp || Date.now();
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const lat = Number(pos.coords.latitude.toFixed(6));
+        const lon = Number(pos.coords.longitude.toFixed(6));
+        const acc = Math.round(pos.coords.accuracy || 5);
+        const spd = Number((pos.coords.speed ? pos.coords.speed * 3.6 : 0.0).toFixed(1));
+        const ts = pos.timestamp || Date.now();
+        const address = `Real GPS Fix: ${lat.toFixed(4)}°, ${lon.toFixed(4)}° (±${acc}m)`;
 
-          setLocation(prev => {
-            if (
-              prev.latitude === lat &&
-              prev.longitude === lon &&
-              prev.accuracy === acc &&
-              prev.speed === spd &&
-              prev.timestamp === ts
-            ) return prev;
-            
-            return {
-              latitude: lat,
-              longitude: lon,
-              accuracy: acc,
-              speed: spd,
-              address: `Real GPS Fix: ${lat.toFixed(4)}°, ${lon.toFixed(4)}° (±${acc}m)`,
-              timestamp: ts,
-            };
-          });
-        },
-        (err) => {
-          console.warn('Real GPS hardware sensor notice:', err.message);
-        },
-        { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 }
-      );
-    }
+        setLocation((prev) =>
+          prev.latitude === lat && prev.longitude === lon && prev.timestamp === ts
+            ? prev
+            : { latitude: lat, longitude: lon, accuracy: acc, speed: spd, address, timestamp: ts }
+        );
 
-    return () => {
-      if (watchId !== null && 'geolocation' in navigator) {
-        navigator.geolocation.clearWatch(watchId);
-      }
-    };
-  }, [selectedRole]);
+        if (pairingCode) {
+          pushData(pairingCode, 'location', {
+            lat,
+            lng: lon,
+            acc,
+            latitude: lat,
+            longitude: lon,
+            accuracy: acc,
+            speed: spd,
+            address,
+            timestamp: ts,
+          }).catch(() => {});
+        }
+      },
+      (err) => console.warn('[KidGuard] Geolocation notice:', err.message),
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 }
+    );
+
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [selectedRole, pairingCode]);
 
   // ----------------------------------------------------
-  // Auth Handlers
+  // Handlers
   // ----------------------------------------------------
-  const handlePinKey = (val: string) => {
-    if (enteredPin.length < 4) {
-      const newPin = enteredPin + val;
-      setEnteredPin(newPin);
-      setPasscodeError(null);
-
-      if (newPin.length === 4) {
-        setTimeout(async () => {
-          try {
-            // Use real email sign-in with the PIN as pseudo-password if desired, 
-            // but for "powerful" we should use real email/pass.
-            // For the PIN flow, we'll keep it as a local-only or mock for now, 
-            // but encourage email auth for the real parent console.
-            const user = { uid: `parent_${newPin}`, email: 'parent@kidguard.family' };
-            saveParentSession(user);
-            setCurrentUser(user);
-            setIsAuthenticated(true);
-            setEnteredPin('');
-            showToast('Passcode PIN Verified (Session Created)');
-          } catch (e) {
-            setPasscodeError('PIN Authentication Failed');
-          }
-        }, 300);
-      }
-    }
-  };
-
-  const handleBackspace = () => {
-    setEnteredPin((prev) => prev.slice(0, -1));
-    setPasscodeError(null);
-  };
-
-  const handleClearPin = () => {
-    setEnteredPin('');
-    setPasscodeError(null);
-  };
-
   const handleEmailAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!emailInput || !passwordInput) {
       setPasscodeError('Please enter both email and password.');
       return;
     }
-    
-    // Basic email validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(emailInput)) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailInput)) {
       setPasscodeError('Please enter a valid email address.');
       return;
     }
 
+    setIsAuthSubmitting(true);
     setPasscodeError(null);
     try {
       if (isRegistering) {
@@ -730,29 +1138,28 @@ export const App: React.FC = () => {
         }
       }
     } catch (err: any) {
-      let errorMessage = 'Authentication Failed';
-      if (err.code === 'auth/invalid-credential') {
-        errorMessage = 'Invalid email or password. Please check your credentials or create a new account.';
-      } else if (err.code === 'auth/too-many-requests') {
-        errorMessage = 'Too many attempts. Please try again later.';
-      } else if (err.code === 'auth/user-not-found') {
-        errorMessage = 'User not found. Please create an account first.';
-      } else if (err.code === 'auth/email-already-in-use') {
-        errorMessage = 'This email is already registered. Please sign in instead.';
-      } else if (err.code === 'auth/weak-password') {
-        errorMessage = 'Password should be at least 6 characters.';
-      }
-      setPasscodeError(errorMessage);
+      const errorMap: Record<string, string> = {
+        'auth/invalid-credential': 'Invalid email or password.',
+        'auth/too-many-requests': 'Too many attempts. Please try again later.',
+        'auth/user-not-found': 'No account found with this email.',
+        'auth/email-already-in-use': 'This email is already registered.',
+        'auth/weak-password': 'Password should be at least 6 characters.',
+      };
+      setPasscodeError(errorMap[err.code] || 'Authentication failed.');
+    } finally {
+      setIsAuthSubmitting(false);
     }
   };
 
-
   const handleSignOut = async () => {
+    cleanupAudioWebRTC();
+    cleanupCameraHardware();
     await fbSignOut();
     setCurrentUser(null);
     setIsAuthenticated(false);
     setSelectedRole(null);
-    setEnteredPin('');
+    hasAutoOpenedAddModalRef.current = false;
+    hasPushedActiveRef.current = false;
     showToast('Signed Out');
   };
 
@@ -765,52 +1172,47 @@ export const App: React.FC = () => {
   };
 
   const handleSwitchRole = () => {
+    cleanupAudioWebRTC();
+    cleanupCameraHardware();
+    setAudioStreamActive(false);
+    setCameraStreamActive(false);
+    setScreenMirrorActive(false);
+    hasPushedActiveRef.current = false;
     localStorage.removeItem('kidguard_device_role');
     setSelectedRole(null);
   };
 
-  // ----------------------------------------------------
-  // Child Controls
-  // ----------------------------------------------------
   const handleToggleScreenMirror = () => {
-    const nextState = !screenMirrorActive;
-    setScreenMirrorActive(nextState);
-    showToast(nextState ? 'Screen Mirroring Service started' : 'Screen Mirroring Service stopped');
+    const next = !screenMirrorActive;
+    setScreenMirrorActive(next);
+    showToast(next ? 'Screen Mirroring started' : 'Screen Mirroring stopped');
     if (database) {
       update(ref(database, `devices/${pairingCode}/screen`), {
-        status: nextState ? 'streaming' : 'standby',
-        isSharing: nextState,
+        status: next ? 'streaming' : 'standby',
+        isSharing: next,
         fps: screenFps,
         updatedAt: Date.now(),
-      });
+      }).catch(() => {});
     }
   };
 
   const handleToggleCameraStream = () => {
-    const nextState = !cameraStreamActive;
-    setCameraStreamActive(nextState);
-    showToast(nextState ? 'Remote Camera Stream active' : 'Remote Camera Stream stopped');
+    const next = !cameraStreamActive;
+    setCameraStreamActive(next);
+    showToast(next ? 'Remote Camera Stream active' : 'Remote Camera Stream stopped');
     if (database) {
       update(ref(database, `devices/${pairingCode}/stream`), {
-        status: nextState ? 'active' : 'stopped',
-        cameraFacing: 'back',
+        status: next ? 'active' : 'stopped',
+        cameraFacing: cameraFacing === 'user' ? 'front' : 'back',
         updatedAt: Date.now(),
-      });
+      }).catch(() => {});
     }
   };
 
   const handleToggleAudioStream = () => {
-    const nextState = !audioStreamActive;
-    setAudioStreamActive(nextState);
-    showToast(nextState ? 'One-Way Audio Stream transmitting' : 'One-Way Audio Stream stopped');
-    if (database) {
-      update(ref(database, `devices/${pairingCode}/audio`), {
-        status: nextState ? 'transmitting' : 'standby',
-        isTransmitting: nextState,
-        sampleRate: 44100,
-        updatedAt: Date.now(),
-      });
-    }
+    const next = !audioStreamActive;
+    setAudioStreamActive(next);
+    showToast(next ? 'Starting WebRTC Audio Stream...' : 'Stopping WebRTC Audio Stream');
   };
 
   const handleCopyPairingCode = () => {
@@ -822,101 +1224,91 @@ export const App: React.FC = () => {
 
   const handleGenerateNewCode = async () => {
     if (!currentUser) {
-      showToast('Please log in first to regenerate code');
+      showToast('Please sign in first to regenerate code');
       return;
     }
-    const chars = '0123456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-    let res = '';
-    for (let i = 0; i < 6; i++) res += chars.charAt(Math.floor(Math.random() * chars.length));
-    const newCode = `FG-${res}`;
-    
+    const newCode = generatePairingCode();
+    const resolvedName = detectDeviceName() || deviceModel;
     setPairingCode(newCode);
     showToast(`Fresh binding code generated: ${newCode}`);
-    
+
     if (database) {
-      const updates: Record<string, any> = {
+      await update(ref(database), {
         [`user_pairing_codes/${currentUser.uid}`]: newCode,
         [`devices/${newCode}`]: {
+          deviceId: childHardwareId,
+          childId: childRecordId,
           pairingCode: newCode,
-          deviceModelName: deviceModel,
+          deviceName: resolvedName,
+          deviceModelName: resolvedName,
           status: 'pending',
           online: true,
+          ts: Date.now(),
           updatedAt: Date.now(),
-        }
-      };
-      await update(ref(database), updates);
+        },
+      }).catch(() => {});
     }
   };
 
-  // ----------------------------------------------------
-  // Parent Console Pairing Handlers
-  // ----------------------------------------------------
   const handlePairChild = async (code: string, modelName: string) => {
     if (!currentUser) throw new Error('Parent not authenticated');
     const newDevice = await pairChildDevice(currentUser.uid, code, modelName);
-    showToast(`Successfully paired device with code ${code}!`);
+    showToast(`Paired device with code ${code}`);
     return newDevice;
   };
 
   const handleUnlinkDevice = async (device: ParentChildDevice) => {
     if (!currentUser) return;
-    try {
-      showToast(`Deleting ${device.deviceModelName}...`);
-      // 1. ఫైర్బేస్ నుండి డిలీట్ చేయడం
-      const success = await deleteChildDevice(device.pairingCode || device.deviceId || '', device.childId);
-      
-      if (success) {
-        // 2. లోకల్ స్టేట్ నుండి వెంటనే ఆ డివైజ్ని తొలగించడం (UI సింక్ అవ్వడానికి)
-        setDevices(prevDevices => prevDevices.filter(d => d.childId !== device.childId && d.deviceId !== device.deviceId));
-        setSelectedChildIds(prev => prev.filter(id => id !== device.childId));
-        console.log("Device removed from UI successfully");
-        showToast(`Successfully deleted ${device.deviceModelName}`);
-      } else {
-        alert("డివైజ్ డిలీట్ కాలేదు. ఒకసారి కన్సోల్ ఎర్రర్స్ చెక్ చేయండి.");
-      }
-    } catch (err) {
-      console.error("Error in handleUnlinkDevice:", err);
-      alert("డివైజ్ డిలీట్ కాలేదు. ఒకసారి కన్సోల్ ఎర్రర్స్ చెక్ చేయండి.");
+    showToast(`Unlinking ${device.deviceModelName}...`);
+    const ok = await deleteChildDevice(
+      device.pairingCode || device.deviceId || '',
+      device.childId,
+      currentUser.uid
+    );
+    if (!ok) return showToast('Failed to unlink device. Check console logs.');
+    const code = normalizeDeviceCode(device);
+    setDevices((prev) =>
+      prev.filter((d) => d.childId !== device.childId && d.deviceId !== device.deviceId)
+    );
+    if (code) {
+      setTelemetryByCode((prev) => {
+        const { [code]: _, ...rest } = prev;
+        return rest;
+      });
     }
+    setSelectedChildIds((prev) => prev.filter((id) => id !== device.childId));
+    showToast(`Unlinked ${device.deviceModelName}`);
   };
 
-  // ====================================================
-  // SCREEN 0: INITIAL AUTH LOADING SPLASH
-  // ====================================================
+  // ----------------------------------------------------
+  // Render States
+  // ----------------------------------------------------
   if (isAuthLoading) {
     return (
       <div className="min-h-screen bg-[#F4F6F4] flex flex-col items-center justify-center p-4">
-        <div className="flex flex-col items-center gap-4">
-          <div className="w-16 h-16 rounded-2xl bg-[#0A9B70] text-white flex items-center justify-center shadow-lg animate-pulse">
-            <Shield className="w-8 h-8" />
-          </div>
-          <div className="flex flex-col items-center gap-1">
-            <h2 className="text-lg font-bold text-[#1D302B]">Secure Family Supervision</h2>
-            <div className="flex items-center gap-2 text-xs text-[#71807B] font-medium">
-              <Loader2 className="w-3 h-3 animate-spin text-[#0A9B70]" />
-              Initializing secure session…
-            </div>
-          </div>
+        <div className="w-16 h-16 rounded-2xl bg-[#0A9B70] text-white flex items-center justify-center shadow-lg animate-pulse mb-3">
+          <Shield className="w-8 h-8" />
+        </div>
+        <h2 className="text-lg font-bold text-[#1D302B]">Secure Family Supervision</h2>
+        <div className="flex items-center gap-2 text-xs text-[#71807B] font-medium mt-1">
+          <Loader2 className="w-3.5 h-3.5 animate-spin text-[#0A9B70]" />
+          Initializing secure session…
         </div>
       </div>
     );
   }
 
-  // ====================================================
-  // SCREEN 1: INITIAL APP LAUNCH & PASSCODE/EMAIL LOGIN
-  // ====================================================
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen bg-[#F4F6F4] flex flex-col items-center justify-center p-4">
         {toastMessage && (
           <div className="fixed top-5 z-50 bg-[#192723] text-white text-xs font-semibold px-4 py-2.5 rounded-full shadow-lg flex items-center gap-2 border border-emerald-500/30">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
             <span>{toastMessage}</span>
           </div>
         )}
 
         <div className="w-full max-w-md bg-white rounded-3xl border border-[#E4E9E5] p-6 sm:p-8 shadow-xl">
-          {/* Logo Badge */}
           <div className="text-center mb-6">
             <div className="w-16 h-16 rounded-2xl bg-[#0A9B70] text-white flex items-center justify-center mx-auto mb-3 shadow-md shadow-emerald-700/20">
               <Shield className="w-8 h-8" />
@@ -932,7 +1324,7 @@ export const App: React.FC = () => {
               <div className="p-4 bg-emerald-50 text-emerald-700 rounded-xl border border-emerald-100 text-sm">
                 <CheckCircle2 className="w-8 h-8 mx-auto mb-2 text-emerald-500" />
                 <p className="font-bold">Verification Email Sent!</p>
-                <p className="text-xs mt-1">Please check your inbox ({emailInput}) and verify your account before logging in.</p>
+                <p className="text-xs mt-1">Verify your inbox ({emailInput}) before signing in.</p>
               </div>
               <button
                 onClick={() => {
@@ -950,11 +1342,11 @@ export const App: React.FC = () => {
             <form onSubmit={handleEmailAuthSubmit} className="space-y-4">
               {passcodeError && (
                 <div className="p-3 bg-rose-50 border border-rose-100 text-rose-600 text-xs rounded-xl flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                  {passcodeError}
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>{passcodeError}</span>
                 </div>
               )}
-              
+
               <div>
                 <label className="block text-xs font-bold text-[#1D302B] mb-1">Email Address</label>
                 <input
@@ -966,6 +1358,7 @@ export const App: React.FC = () => {
                   required
                 />
               </div>
+
               <div>
                 <label className="block text-xs font-bold text-[#1D302B] mb-1">Password</label>
                 <input
@@ -980,15 +1373,17 @@ export const App: React.FC = () => {
 
               <button
                 type="submit"
-                className="w-full h-10 rounded-xl text-xs font-bold bg-[#0A9B70] hover:bg-[#087957] text-white transition-colors shadow-xs"
+                disabled={isAuthSubmitting}
+                className="w-full h-10 rounded-xl text-xs font-bold bg-[#0A9B70] hover:bg-[#087957] disabled:opacity-60 text-white transition-colors flex items-center justify-center gap-2"
               >
-                {isRegistering ? 'Create Account' : 'Sign In to KidGuard'}
+                {isAuthSubmitting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>{isRegistering ? 'Create Account' : 'Sign In to KidGuard'}</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => {
-                  setIsRegistering(!isRegistering);
+                  setIsRegistering((prev) => !prev);
                   setPasscodeError(null);
                 }}
                 className="w-full text-center text-xs text-[#0A9B70] hover:underline font-semibold"
@@ -997,25 +1392,14 @@ export const App: React.FC = () => {
               </button>
             </form>
           )}
-
         </div>
       </div>
     );
   }
 
-  // ====================================================
-  // SCREEN 2: ROLE SELECTION (Parent App vs Child App)
-  // ====================================================
   if (selectedRole === null) {
     return (
       <div className="min-h-screen bg-[#F4F6F4] flex flex-col items-center justify-center p-4">
-        {toastMessage && (
-          <div className="fixed top-5 z-50 bg-[#192723] text-white text-xs font-semibold px-4 py-2.5 rounded-full shadow-lg flex items-center gap-2 border border-emerald-500/30">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-            <span>{toastMessage}</span>
-          </div>
-        )}
-
         <div className="w-full max-w-xl bg-white rounded-3xl border border-[#E4E9E5] p-6 sm:p-8 shadow-xl">
           <div className="flex items-center justify-between pb-4 border-b border-[#E4E9E5] mb-6">
             <div className="flex items-center gap-2.5">
@@ -1041,13 +1425,11 @@ export const App: React.FC = () => {
               Who is using this device?
             </h2>
             <p className="text-xs text-[#71807B] mt-1 max-w-md mx-auto">
-              Select the role for this session. You can easily switch roles at any time from the top bar.
+              Select the role for this session. Switch roles anytime from the top bar.
             </p>
           </div>
 
-          {/* Role Choice Cards */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {/* Option 1: Parent Console */}
             <button
               onClick={() => handleSelectRole('parent')}
               className="p-5 rounded-2xl border-2 border-emerald-500 bg-[#F8FAF9] hover:bg-emerald-50/70 text-left transition-all hover:shadow-md group flex flex-col justify-between"
@@ -1059,17 +1441,15 @@ export const App: React.FC = () => {
                 <h3 className="text-base font-extrabold text-[#1D302B]">I am a Parent</h3>
                 <span className="text-[11px] font-bold text-[#0A9B70] block mt-0.5">Parent Monitoring Console</span>
                 <p className="text-xs text-[#71807B] mt-2 leading-relaxed">
-                  Enter the child's 4-digit code to pair. Track live GPS location, view live screen mirror, camera streams, call logs, and app usage.
+                  Pair via child binding code. Track live GPS, screen mirror, camera streams, calls, and app usage.
                 </p>
               </div>
-
               <div className="mt-4 pt-3 border-t border-emerald-200/60 flex items-center justify-between text-xs font-bold text-[#0A9B70]">
                 <span>Open Parent Dashboard</span>
                 <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
               </div>
             </button>
 
-            {/* Option 2: Child Client */}
             <button
               onClick={() => handleSelectRole('child')}
               className="p-5 rounded-2xl border-2 border-[#E4E9E5] hover:border-emerald-500 bg-[#F8FAF9] hover:bg-emerald-50/70 text-left transition-all hover:shadow-md group flex flex-col justify-between"
@@ -1081,10 +1461,9 @@ export const App: React.FC = () => {
                 <h3 className="text-base font-extrabold text-[#1D302B]">I am a Child</h3>
                 <span className="text-[11px] font-bold text-blue-600 block mt-0.5">Child Protection Client</span>
                 <p className="text-xs text-[#71807B] mt-2 leading-relaxed">
-                  Generates a secure 4-digit pairing code to link with your parent. Runs safe background telemetry for battery, location, and services.
+                  Generates a secure binding code and syncs battery, GPS, and active protection services.
                 </p>
               </div>
-
               <div className="mt-4 pt-3 border-t border-neutral-200/60 flex items-center justify-between text-xs font-bold text-neutral-700 group-hover:text-[#0A9B70]">
                 <span>Open Child Client</span>
                 <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
@@ -1092,7 +1471,7 @@ export const App: React.FC = () => {
             </button>
           </div>
 
-          <div className="mt-6 flex items-center justify-between text-xs text-[#71807B]">
+          <div className="mt-6 flex items-center text-xs text-[#71807B]">
             <label className="flex items-center gap-2 cursor-pointer">
               <input
                 type="checkbox"
@@ -1108,24 +1487,22 @@ export const App: React.FC = () => {
     );
   }
 
-  // ====================================================
-  // SCREEN 3A: CHILD PROTECTION CLIENT
-  // ====================================================
   if (selectedRole === 'child') {
     return (
       <div className="min-h-screen bg-[#F4F6F4] text-[#1D302B] flex flex-col items-center">
         {toastMessage && (
           <div className="fixed top-5 z-50 bg-[#192723] text-white text-xs font-semibold px-4 py-2.5 rounded-full shadow-lg flex items-center gap-2 border border-emerald-500/30">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
             <span>{toastMessage}</span>
           </div>
         )}
 
-        {/* Top Role Switcher Bar */}
         <div className="w-full bg-[#192723] text-white px-4 py-2 border-b border-emerald-950 flex items-center justify-between text-xs">
           <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-            <span className="font-bold">Device Mode: <span className="text-[#34D399]">Child Protection Client</span></span>
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span className="font-bold">
+              Device Mode: <span className="text-[#34D399]">Child Protection Client</span>
+            </span>
           </div>
           <div className="flex items-center gap-3">
             <button
@@ -1134,17 +1511,12 @@ export const App: React.FC = () => {
             >
               ⇄ Switch to Parent Console
             </button>
-            <button
-              onClick={handleSignOut}
-              className="text-neutral-400 hover:text-white"
-              title="Sign Out"
-            >
+            <button onClick={handleSignOut} className="text-neutral-400 hover:text-white" title="Sign Out">
               <LogOut className="w-3.5 h-3.5" />
             </button>
           </div>
         </div>
 
-        {/* Child Top Bar */}
         <header className="w-full bg-white border-b border-[#E4E9E5] sticky top-0 z-30">
           <div className="max-w-2xl mx-auto px-4 sm:px-6 py-3.5 flex items-center justify-between">
             <div className="flex items-center gap-2.5">
@@ -1153,36 +1525,31 @@ export const App: React.FC = () => {
               </div>
               <div>
                 <h1 className="text-sm font-bold text-[#1D302B] leading-none">KidGuard Protection</h1>
-                <span className="text-[10px] text-[#71807B] leading-tight block mt-0.5">Continuous Foreground Service Active</span>
+                <span className="text-[10px] text-[#71807B] leading-tight block mt-0.5">
+                  Continuous Foreground Service Active
+                </span>
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
-              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#ECFDF5] border border-[#A7F3D0] text-[11px] font-bold text-[#065F46]">
-                <span className="w-2 h-2 rounded-full bg-[#10B981] animate-pulse"></span>
-                Live Synced
-              </div>
+            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#ECFDF5] border border-[#A7F3D0] text-[11px] font-bold text-[#065F46]">
+              <span className="w-2 h-2 rounded-full bg-[#10B981] animate-pulse" />
+              Live Synced • {batteryLevel}%{isCharging ? ' ⚡' : ''}
             </div>
           </div>
         </header>
 
-        {/* Main Content Dashboard */}
         <main className="w-full max-w-2xl px-4 sm:px-6 py-6 space-y-4 flex-1">
-          {/* 1. Header with Device Name and 4-Digit Bind Code */}
           <div className="rounded-2xl p-6 bg-gradient-to-br from-[#192723] to-[#263D36] text-white shadow-md relative overflow-hidden">
-            <div className="absolute -right-8 -bottom-8 w-36 h-36 bg-emerald-500/10 rounded-full blur-2xl pointer-events-none"></div>
-
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
               <div className="flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                <span className="w-2 h-2 rounded-full bg-emerald-400" />
                 <span className="text-[10px] font-extrabold tracking-wider uppercase text-[#91D5AD]">ACTIVE DEVICE</span>
               </div>
 
               <div className="flex items-center gap-2">
                 <button
                   onClick={handleGenerateNewCode}
-                  title="Generate Fresh Code"
-                  className="bg-white/10 hover:bg-white/20 text-white px-2 py-1 rounded-lg text-xs flex items-center gap-1"
+                  className="bg-white/10 hover:bg-white/20 text-white px-2.5 py-1 rounded-lg text-xs flex items-center gap-1"
                 >
                   <RefreshCw className="w-3 h-3" />
                   <span>Regenerate</span>
@@ -1190,12 +1557,15 @@ export const App: React.FC = () => {
 
                 <button
                   onClick={handleCopyPairingCode}
-                  title="Click to copy pairing code"
                   className="inline-flex items-center gap-1.5 bg-white/10 hover:bg-white/20 active:scale-95 transition-all text-white px-3 py-1 rounded-lg border border-white/15 text-xs font-mono"
                 >
                   <span className="text-[11px] text-white/70">Pairing Code:</span>
                   <span className="font-extrabold text-[#34D399] tracking-wider">{pairingCode}</span>
-                  {copied ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5 text-white/70" />}
+                  {copied ? (
+                    <Check className="w-3.5 h-3.5 text-emerald-300" />
+                  ) : (
+                    <Copy className="w-3.5 h-3.5 text-white/70" />
+                  )}
                 </button>
               </div>
             </div>
@@ -1205,91 +1575,85 @@ export const App: React.FC = () => {
               <p className="text-xs text-[#9EB5AB] mt-0.5">{deviceModel}</p>
             </div>
 
-            <div className="mt-5 pt-4 border-t border-white/10 flex flex-wrap items-center justify-between text-[11px]">
+            <div className="mt-5 pt-4 border-t border-white/10 flex flex-wrap items-center justify-between gap-2 text-[11px]">
               <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white/10 text-white/90">
                 <Wifi className="w-3 h-3 text-emerald-400" />
                 Firebase RTDB: /devices/{pairingCode}
               </span>
+              <span className="text-white/70">{location.address}</span>
             </div>
           </div>
 
-          {/* 2. Simplified Protection Status (FlashGet Style) */}
-          <div className="bg-white rounded-3xl p-8 border border-[#E4E9E5] shadow-xl text-center space-y-6">
-            <div className="w-24 h-24 rounded-full bg-emerald-50 text-[#0A9B70] flex items-center justify-center mx-auto border-4 border-emerald-100/50 shadow-inner">
-              <Shield className="w-12 h-12 animate-pulse" />
+          <div className="bg-white rounded-3xl p-6 sm:p-8 border border-[#E4E9E5] shadow-xl text-center space-y-5">
+            <div className="w-20 h-20 rounded-full bg-emerald-50 text-[#0A9B70] flex items-center justify-center mx-auto border-4 border-emerald-100/50">
+              <Shield className="w-10 h-10" />
             </div>
-            
+
             <div>
               <h3 className="text-xl font-black text-[#1D302B] tracking-tight">Device Protected</h3>
-              <p className="text-sm text-[#71807B] mt-2 leading-relaxed">
-                Everything is working correctly. Your parent can now supervise this device activities remotely.
+              <p className="text-sm text-[#71807B] mt-1.5">
+                Supervision services and telemetry synchronization are running for this device.
               </p>
             </div>
 
-            <div className="pt-4 border-t border-[#F1F5F2] flex flex-col gap-3">
+            <div className="pt-3 border-t border-[#F1F5F2] flex flex-col gap-2.5">
               <div className="flex items-center justify-between text-xs font-bold text-[#71807B] bg-[#F8FAF9] p-3 rounded-2xl border border-[#E8ECE9]">
                 <div className="flex items-center gap-2">
-                  <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
+                  <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
                   <span>Background Monitoring</span>
                 </div>
                 <span className="text-[#0A9B70]">ACTIVE</span>
               </div>
-              
+
               <div className="flex items-center justify-between text-xs font-bold text-[#71807B] bg-[#F8FAF9] p-3 rounded-2xl border border-[#E8ECE9]">
                 <div className="flex items-center gap-2">
-                  <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>
+                  <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
                   <span>Safe GPS Tracking</span>
                 </div>
                 <span className="text-blue-600">ACTIVE</span>
               </div>
 
               {childStreamStatus.toLowerCase().includes('denied') && (
-                <div className="w-full p-4 mb-4 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs text-left">
+                <div className="p-4 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs text-left">
                   <p className="font-bold mb-1">Access Denied</p>
-                  <p>Browser is blocking the camera. Please click the <b>Lock/Settings icon</b> in your browser address bar, reset permissions, and refresh the page.</p>
+                  <p>Reset browser site permissions via the address bar icon and refresh.</p>
                 </div>
               )}
-              <button 
+
+              <button
                 onClick={async () => {
                   try {
-                    await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    stream.getTracks().forEach((t) => t.stop());
                     setChildStreamStatus('Access active');
-                    showToast('Permissions granted!');
+                    showToast('Camera & Mic permissions granted!');
                   } catch (err: any) {
-                    console.warn('Manual permission grant failed:', err);
-                    const friendlyMsg = err.name === 'NotAllowedError' ? 'Permission denied' : err.message;
-                    setChildStreamStatus(`Error: ${friendlyMsg}`);
-                    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-                      showToast('Permission denied. Please click the Lock icon in address bar to reset.');
-                    } else if (err.name === 'SecurityError' || err.message?.includes('policy')) {
-                      showToast('Browser policy restricted.');
-                    } else {
-                      showToast(`Error: ${friendlyMsg}`);
-                    }
+                    const friendly = err.name === 'NotAllowedError' ? 'Permission denied' : err.message;
+                    setChildStreamStatus(`Error: ${friendly}`);
+                    showToast(`Error: ${friendly}`);
                   }
                 }}
-                className="w-full py-3 rounded-2xl bg-[#0A9B70] text-white text-xs font-bold hover:bg-[#087957] transition-colors shadow-sm active:scale-[0.98]"
+                className="w-full py-3 rounded-2xl bg-[#0A9B70] text-white text-xs font-bold hover:bg-[#087957] transition-colors shadow-sm"
               >
                 Grant Camera & Mic Access
               </button>
             </div>
           </div>
 
-          {/* 3. Real-Time Activity Log (Optional Notifications Only) */}
           <div className="bg-white rounded-3xl p-6 border border-[#E4E9E5] shadow-xs">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-xs font-black text-[#1D302B] tracking-widest uppercase">LATEST SYSTEM ALERTS</h3>
               <Bell className="w-4 h-4 text-[#71807B]" />
             </div>
-            
+
             <div className="space-y-3">
               <div className="p-3 rounded-2xl bg-emerald-50/50 border border-emerald-100 flex items-start gap-3">
                 <div className="w-8 h-8 rounded-xl bg-white flex items-center justify-center shadow-xs shrink-0">
                   <Shield className="w-4 h-4 text-[#0A9B70]" />
                 </div>
                 <div>
-                  <p className="text-[11px] font-bold text-[#1D302B]">Security Sync Successful</p>
-                  <p className="text-[10px] text-[#71807B]">Device status was updated 1 minute ago.</p>
+                  <p className="text-[11px] font-bold text-[#1D302B]">Security Sync Active</p>
+                  <p className="text-[10px] text-[#71807B]">Battery: {batteryLevel}% • Voltage: {batteryVoltage}V</p>
                 </div>
               </div>
               <div className="p-3 rounded-2xl bg-indigo-50/50 border border-indigo-100 flex items-start gap-3">
@@ -1298,13 +1662,13 @@ export const App: React.FC = () => {
                 </div>
                 <div>
                   <p className="text-[11px] font-bold text-[#1D302B]">Background Service Running</p>
-                  <p className="text-[10px] text-[#71807B]">Continuous protection is active in background.</p>
+                  <p className="text-[10px] text-[#71807B]">Continuous protection active for {pairingCode}</p>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* 4. Active Background Services List */}
+          {/* Active Background Services */}
           <div className="space-y-2.5 pt-2">
             <div className="flex items-center justify-between px-1">
               <h3 className="text-xs font-extrabold text-[#71807B] tracking-wider uppercase">
@@ -1313,47 +1677,28 @@ export const App: React.FC = () => {
               <span className="text-[10px] text-[#71807B]">Android 14 Foreground Types</span>
             </div>
 
-            {/* Service 1: Screen Mirroring */}
-            <div className={`bg-white rounded-2xl p-4 border transition-all ${
-              screenMirrorActive ? 'border-[#0A9B70] shadow-sm' : 'border-[#E4E9E5]'
-            }`}>
+            {/* Screen Mirror */}
+            <div className={`bg-white rounded-2xl p-4 border transition-all ${screenMirrorActive ? 'border-[#0A9B70] shadow-sm' : 'border-[#E4E9E5]'}`}>
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
-                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${
-                    screenMirrorActive ? 'bg-indigo-100 text-indigo-700' : 'bg-neutral-100 text-neutral-500'
-                  }`}>
+                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${screenMirrorActive ? 'bg-indigo-100 text-indigo-700' : 'bg-neutral-100 text-neutral-500'}`}>
                     <ScreenShare className="w-5 h-5" />
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
                       <h4 className="text-sm font-bold text-[#1D302B]">Screen Mirroring Service</h4>
-                      {screenMirrorActive ? (
-                        <span className="px-2 py-0.5 rounded-md bg-[#ECFDF5] border border-[#A7F3D0] text-[#065F46] text-[9px] font-extrabold uppercase animate-pulse">
-                          STREAMING
-                        </span>
-                      ) : (
-                        <span className="px-2 py-0.5 rounded-md bg-neutral-100 text-neutral-500 text-[9px] font-bold uppercase">
-                          STANDBY
-                        </span>
-                      )}
+                      <span className={`px-2 py-0.5 rounded-md text-[9px] font-extrabold uppercase ${screenMirrorActive ? 'bg-[#ECFDF5] border border-[#A7F3D0] text-[#065F46] animate-pulse' : 'bg-neutral-100 text-neutral-500'}`}>
+                        {screenMirrorActive ? 'STREAMING' : 'STANDBY'}
+                      </span>
                     </div>
                     <p className="text-[11px] text-[#71807B] mt-0.5">
                       MediaProjection foreground capture to /devices/{pairingCode}/screen
                     </p>
                     {screenMirrorActive && (
                       <div className="mt-3 relative rounded-xl overflow-hidden bg-black aspect-video border border-indigo-500/30">
-                        <video 
-                          ref={childScreenPreviewRef} 
-                          autoPlay 
-                          playsInline 
-                          muted 
-                          className="w-full h-full object-cover"
-                        />
-                        <div className="absolute top-2 left-2 px-2 py-0.5 rounded bg-indigo-600 text-white text-[9px] font-bold animate-pulse">
-                          SCREEN SHARING
-                        </div>
+                        <video ref={childScreenPreviewRef} autoPlay playsInline muted className="w-full h-full object-cover" />
                         {childScreenStatus && (
-                          <div className="absolute bottom-0 inset-x-0 bg-black/60 backdrop-blur-sm p-1.5 text-[9px] text-white text-center font-medium">
+                          <div className="absolute bottom-0 inset-x-0 bg-black/60 p-1.5 text-[9px] text-white text-center">
                             {childScreenStatus}
                           </div>
                         )}
@@ -1367,54 +1712,43 @@ export const App: React.FC = () => {
                   role="switch"
                   aria-checked={screenMirrorActive}
                   onClick={handleToggleScreenMirror}
-                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
-                    screenMirrorActive ? 'bg-[#0A9B70]' : 'bg-neutral-300'
-                  }`}
+                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${screenMirrorActive ? 'bg-[#0A9B70]' : 'bg-neutral-300'}`}
                 >
-                  <span
-                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out ${
-                      screenMirrorActive ? 'translate-x-5' : 'translate-x-0'
-                    }`}
-                  />
+                  <span className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-md transition ${screenMirrorActive ? 'translate-x-5' : 'translate-x-0'}`} />
                 </button>
               </div>
             </div>
 
-            {/* Service 2: Remote Camera Stream */}
-            <div className={`bg-white rounded-2xl p-4 border transition-all ${
-              cameraStreamActive ? 'border-[#0A9B70] shadow-sm' : 'border-[#E4E9E5]'
-            }`}>
+            {/* Camera Stream */}
+            <div className={`bg-white rounded-2xl p-4 border transition-all ${cameraStreamActive ? 'border-[#0A9B70] shadow-sm' : 'border-[#E4E9E5]'}`}>
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
-                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${
-                    cameraStreamActive ? 'bg-emerald-100 text-[#0A9B70]' : 'bg-neutral-100 text-neutral-500'
-                  }`}>
+                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${cameraStreamActive ? 'bg-emerald-100 text-[#0A9B70]' : 'bg-neutral-100 text-neutral-500'}`}>
                     <Video className="w-5 h-5" />
                   </div>
                   <div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <h4 className="text-sm font-bold text-[#1D302B]">Remote Camera Stream</h4>
                       <span className="px-2 py-0.5 rounded-md bg-neutral-100 border border-neutral-200 text-neutral-700 text-[9px] font-extrabold uppercase">
-                        BACK LENS
+                        {cameraFacing === 'user' ? 'FRONT LENS' : 'BACK LENS'}
                       </span>
+                      <button
+                        type="button"
+                        onClick={() => void handleSwitchCameraFast()}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 hover:bg-emerald-100 text-[#0A9B70] text-[10px] font-bold transition-colors"
+                      >
+                        <SwitchCamera className="w-3 h-3" />
+                        <span>Flip Lens</span>
+                      </button>
                     </div>
                     <p className="text-[11px] text-[#71807B] mt-0.5">
-                      Live encrypted WebRTC camera service linked to /devices/{pairingCode}/stream
+                      Live WebRTC camera stream linked to /devices/{pairingCode}/stream
                     </p>
                     {cameraStreamActive && (
                       <div className="mt-3 relative rounded-xl overflow-hidden bg-black aspect-video border border-emerald-500/30">
-                        <video 
-                          ref={childVideoPreviewRef} 
-                          autoPlay 
-                          playsInline 
-                          muted 
-                          className="w-full h-full object-cover"
-                        />
-                        <div className="absolute top-2 left-2 px-2 py-0.5 rounded bg-emerald-500 text-white text-[9px] font-bold animate-pulse">
-                          LIVE PREVIEW
-                        </div>
+                        <video ref={childVideoPreviewRef} autoPlay playsInline muted className="w-full h-full object-cover" />
                         {childStreamStatus && (
-                          <div className="absolute bottom-0 inset-x-0 bg-black/60 backdrop-blur-sm p-1.5 text-[9px] text-white text-center font-medium">
+                          <div className="absolute bottom-0 inset-x-0 bg-black/60 p-1.5 text-[9px] text-white text-center">
                             {childStreamStatus}
                           </div>
                         )}
@@ -1428,46 +1762,33 @@ export const App: React.FC = () => {
                   role="switch"
                   aria-checked={cameraStreamActive}
                   onClick={handleToggleCameraStream}
-                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
-                    cameraStreamActive ? 'bg-[#0A9B70]' : 'bg-neutral-300'
-                  }`}
+                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${cameraStreamActive ? 'bg-[#0A9B70]' : 'bg-neutral-300'}`}
                 >
-                  <span
-                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out ${
-                      cameraStreamActive ? 'translate-x-5' : 'translate-x-0'
-                    }`}
-                  />
+                  <span className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-md transition ${cameraStreamActive ? 'translate-x-5' : 'translate-x-0'}`} />
                 </button>
               </div>
             </div>
 
-            {/* Service 3: Audio Stream */}
-            <div className={`bg-white rounded-2xl p-4 border transition-all ${
-              audioStreamActive ? 'border-[#0A9B70] shadow-sm' : 'border-[#E4E9E5]'
-            }`}>
+            {/* WebRTC Audio Stream */}
+            <div className={`bg-white rounded-2xl p-4 border transition-all ${audioStreamActive ? 'border-[#0A9B70] shadow-sm' : 'border-[#E4E9E5]'}`}>
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
-                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${
-                    audioStreamActive ? 'bg-pink-100 text-pink-600' : 'bg-neutral-100 text-neutral-500'
-                  }`}>
+                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${audioStreamActive ? 'bg-pink-100 text-pink-600' : 'bg-neutral-100 text-neutral-500'}`}>
                     <Mic className="w-5 h-5" />
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
                       <h4 className="text-sm font-bold text-[#1D302B]">One-Way Audio Stream</h4>
-                      {audioStreamActive ? (
-                        <span className="px-2 py-0.5 rounded-md bg-[#FDF2F8] border border-[#FBCFE8] text-[#BE185D] text-[9px] font-extrabold uppercase animate-pulse">
-                          TRANSMITTING
-                        </span>
-                      ) : (
-                        <span className="px-2 py-0.5 rounded-md bg-neutral-100 text-neutral-500 text-[9px] font-bold uppercase">
-                          STANDBY
-                        </span>
-                      )}
+                      <span className={`px-2 py-0.5 rounded-md text-[9px] font-extrabold uppercase ${audioStreamActive ? 'bg-[#FDF2F8] border border-[#FBCFE8] text-[#BE185D] animate-pulse' : 'bg-neutral-100 text-neutral-500'}`}>
+                        {audioStreamActive ? 'WEBRTC LIVE' : 'STANDBY'}
+                      </span>
                     </div>
                     <p className="text-[11px] text-[#71807B] mt-0.5">
-                      Background microphone relay to /devices/{pairingCode}/audio
+                      WebRTC audio signaling via /devices/{pairingCode}/audio
                     </p>
+                    {audioSignalingStatus && (
+                      <p className="text-[10px] font-semibold text-[#0A9B70] mt-1">{audioSignalingStatus}</p>
+                    )}
                   </div>
                 </div>
 
@@ -1476,21 +1797,15 @@ export const App: React.FC = () => {
                   role="switch"
                   aria-checked={audioStreamActive}
                   onClick={handleToggleAudioStream}
-                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
-                    audioStreamActive ? 'bg-[#0A9B70]' : 'bg-neutral-300'
-                  }`}
+                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${audioStreamActive ? 'bg-[#0A9B70]' : 'bg-neutral-300'}`}
                 >
-                  <span
-                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out ${
-                      audioStreamActive ? 'translate-x-5' : 'translate-x-0'
-                    }`}
-                  />
+                  <span className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-md transition ${audioStreamActive ? 'translate-x-5' : 'translate-x-0'}`} />
                 </button>
               </div>
             </div>
           </div>
 
-          {/* Primary Guardian Card */}
+          {/* Guardian Info */}
           <div className="bg-white rounded-2xl p-5 border border-[#E4E9E5] shadow-xs">
             <div className="flex items-center justify-between">
               <span className="text-[10px] font-extrabold text-[#71807B] uppercase tracking-wider">
@@ -1500,24 +1815,21 @@ export const App: React.FC = () => {
                 Verified & Synced
               </span>
             </div>
-
-            <div className="mt-3.5 flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-11 h-11 rounded-full bg-[#0A9B70]/15 text-[#0A9B70] flex items-center justify-center font-extrabold text-sm">
-                  SM
-                </div>
-                <div>
-                  <h4 className="text-sm font-bold text-[#1D302B]">{guardian.name}</h4>
-                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#71807B] mt-0.5">
-                    <span className="flex items-center gap-1">
-                      <Phone className="w-3 h-3 text-[#0A9B70]" />
-                      {guardian.phone}
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <Mail className="w-3 h-3 text-neutral-400" />
-                      {guardian.email}
-                    </span>
-                  </div>
+            <div className="mt-3.5 flex items-center gap-3">
+              <div className="w-11 h-11 rounded-full bg-[#0A9B70]/15 text-[#0A9B70] flex items-center justify-center font-extrabold text-sm">
+                SM
+              </div>
+              <div>
+                <h4 className="text-sm font-bold text-[#1D302B]">{guardian.name}</h4>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#71807B] mt-0.5">
+                  <span className="flex items-center gap-1">
+                    <Phone className="w-3 h-3 text-[#0A9B70]" />
+                    {guardian.phone}
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <Mail className="w-3 h-3 text-neutral-400" />
+                    {guardian.email}
+                  </span>
                 </div>
               </div>
             </div>
@@ -1527,26 +1839,27 @@ export const App: React.FC = () => {
     );
   }
 
-  // ====================================================
-  // SCREEN 3B: PARENT DASHBOARD CONSOLE
-  // ====================================================
-  const onlineCount = devices.filter((d) => d.isOnline).length;
+  // ----------------------------------------------------
+  // Parent Console View
+  // ----------------------------------------------------
+  const onlineCount = liveDevices.filter((d) => d.isOnline).length;
+  const cameraModalDevice = activeStreamingDevice || (currentSection === 'camera' ? selectedDevice : null);
 
   return (
     <div className="min-h-screen bg-[#F4F6F4] flex flex-col">
-      {/* Toast Notification */}
       {toastMessage && (
         <div className="fixed top-5 z-50 right-5 bg-[#192723] text-white text-xs font-semibold px-4 py-2.5 rounded-full shadow-lg flex items-center gap-2 border border-emerald-500/30">
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
           <span>{toastMessage}</span>
         </div>
       )}
 
-      {/* Top Role Switcher Bar */}
       <div className="w-full bg-[#192723] text-white px-4 sm:px-6 py-2 border-b border-emerald-950 flex items-center justify-between text-xs z-40">
         <div className="flex items-center gap-2">
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-          <span className="font-bold">Device Mode: <span className="text-[#34D399]">Parent Console</span></span>
+          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+          <span className="font-bold">
+            Device Mode: <span className="text-[#34D399]">Parent Console</span>
+          </span>
         </div>
         <div className="flex items-center gap-3">
           <button
@@ -1555,18 +1868,13 @@ export const App: React.FC = () => {
           >
             ⇄ Switch to Child Client
           </button>
-          <button
-            onClick={handleSignOut}
-            className="text-neutral-400 hover:text-white"
-            title="Sign Out"
-          >
+          <button onClick={handleSignOut} className="text-neutral-400 hover:text-white" title="Sign Out">
             <LogOut className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
       <div className="flex flex-1">
-        {/* Sidebar Navigation */}
         <Sidebar
           currentSection={currentSection}
           onSelectSection={setCurrentSection}
@@ -1574,86 +1882,112 @@ export const App: React.FC = () => {
           onResetAll={handleClearAllDevices}
         />
 
-        {/* Main Content Area */}
-        <div className="flex-1 p-6 md:p-8 max-w-7xl mx-auto w-full">
-          {/* Header */}
+        <div className="flex-1 p-6 md:p-8 max-w-7xl mx-auto w-full space-y-6">
           <Header
             currentSection={currentSection}
             parentEmail={currentUser?.email || 'parent@kidguard.family'}
             onSignOut={handleSignOut}
             onOpenAuth={() => setIsAuthModalOpen(true)}
             onOpenAddChild={() => setIsAddChildModalOpen(true)}
-            deviceCount={devices.length}
+            deviceCount={liveDevices.length}
           />
 
-          {/* Section 1: Family Devices */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="bg-white rounded-2xl p-4 border border-[#E4E9E5] flex items-center justify-between">
+              <div>
+                <span className="text-[11px] font-bold text-[#71807B] uppercase">Paired Devices</span>
+                <p className="text-2xl font-extrabold text-[#1D302B] mt-0.5">{liveDevices.length}</p>
+              </div>
+              <Smartphone className="w-6 h-6 text-[#0A9B70]" />
+            </div>
+            <div className="bg-white rounded-2xl p-4 border border-[#E4E9E5] flex items-center justify-between">
+              <div>
+                <span className="text-[11px] font-bold text-[#71807B] uppercase">Online Now</span>
+                <p className="text-2xl font-extrabold text-emerald-600 mt-0.5">{onlineCount}</p>
+              </div>
+              <Activity className="w-6 h-6 text-emerald-600" />
+            </div>
+            <div className="bg-white rounded-2xl p-4 border border-[#E4E9E5] flex items-center justify-between">
+              <div>
+                <span className="text-[11px] font-bold text-[#71807B] uppercase">Active Target</span>
+                <p className="text-sm font-extrabold text-[#1D302B] mt-1 truncate max-w-[170px]">
+                  {selectedDevice?.deviceModelName || 'None Selected'}
+                </p>
+              </div>
+              <Shield className="w-6 h-6 text-indigo-600" />
+            </div>
+          </div>
+
           {currentSection === 'devices' && (
-            <div className="space-y-6">
-              {devices.length === 0 ? (
+            <div className="space-y-4">
+              {liveDevices.length === 0 ? (
                 <div className="text-center py-16 bg-white rounded-2xl border border-[#E4E9E5] p-8">
                   <div className="w-14 h-14 rounded-full bg-emerald-50 text-[#0A9B70] flex items-center justify-center mx-auto mb-4">
                     <Smartphone className="w-7 h-7" />
                   </div>
-                  <h3 className="text-lg font-extrabold text-[#1D302B]">Scan or enter 4-digit bind code to connect device</h3>
+                  <h3 className="text-lg font-extrabold text-[#1D302B]">Enter binding code to connect device</h3>
                   <p className="text-xs text-[#71807B] max-w-sm mx-auto mt-1 mb-5">
-                    No active physical devices linked in Firebase RTDB. Open the Child Protection Client on the target phone to acquire real hardware telemetry.
+                    No active child devices linked yet. Open the Child Protection Client to get a pairing code.
                   </p>
                   <button
                     onClick={() => setIsAddChildModalOpen(true)}
                     className="px-4 py-2.5 rounded-xl text-xs font-bold bg-[#0A9B70] text-white hover:bg-[#087957] transition-colors"
                   >
-                    Pair Device with 4-Digit Code
+                    Pair Device with Code
                   </button>
                 </div>
               ) : (
-                <div className="space-y-4">
-                  {/* Selection Bar */}
-                  <div className="flex items-center justify-between bg-white px-4 py-3 rounded-xl border border-[#E4E9E5] shadow-xs">
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-3 bg-white px-4 py-3 rounded-xl border border-[#E4E9E5]">
                     <div className="flex items-center gap-3">
-                      <button 
+                      <button
                         onClick={handleSelectAll}
-                        className="flex items-center gap-2 text-xs font-bold text-[#1D302B] hover:text-[#0A9B70] transition-colors"
+                        className="flex items-center gap-2 text-xs font-bold text-[#1D302B] hover:text-[#0A9B70]"
                       >
-                        <div className={`w-4 h-4 rounded border flex items-center justify-center transition-all ${
-                          selectedChildIds.length === devices.length && devices.length > 0
-                            ? 'bg-[#0A9B70] border-[#0A9B70] text-white' 
-                            : 'bg-white border-neutral-300'
-                        }`}>
-                          {selectedChildIds.length === devices.length && devices.length > 0 && <Check className="w-2.5 h-2.5" />}
+                        <div
+                          className={`w-4 h-4 rounded border flex items-center justify-center ${
+                            selectedChildIds.length === filteredDevices.length && filteredDevices.length > 0
+                              ? 'bg-[#0A9B70] border-[#0A9B70] text-white'
+                              : 'bg-white border-neutral-300'
+                          }`}
+                        >
+                          {selectedChildIds.length === filteredDevices.length && filteredDevices.length > 0 && (
+                            <Check className="w-2.5 h-2.5" />
+                          )}
                         </div>
-                        <span>Select All ({devices.length})</span>
+                        <span>Select All ({filteredDevices.length})</span>
                       </button>
-                      
+
                       {selectedChildIds.length > 0 && (
-                        <div className="h-4 w-px bg-neutral-200"></div>
-                      )}
-                      
-                      {selectedChildIds.length > 0 && (
-                        <span className="text-[11px] font-medium text-[#71807B]">
-                          {selectedChildIds.length} item{selectedChildIds.length !== 1 ? 's' : ''} selected
-                        </span>
+                        <button
+                          onClick={handleBulkDelete}
+                          disabled={isBulkDeleting}
+                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-50 hover:bg-red-100 text-red-600 text-xs font-bold disabled:opacity-50"
+                        >
+                          {isBulkDeleting ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Delete className="w-3.5 h-3.5" />
+                          )}
+                          <span>Delete Selected ({selectedChildIds.length})</span>
+                        </button>
                       )}
                     </div>
 
-                    {selectedChildIds.length > 0 && (
-                      <button
-                        onClick={handleBulkDelete}
-                        disabled={isBulkDeleting}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-50 hover:bg-red-100 text-red-600 text-xs font-bold transition-all disabled:opacity-50"
-                      >
-                        {isBulkDeleting ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <Delete className="w-3.5 h-3.5" />
-                        )}
-                        <span>Delete Selected</span>
-                      </button>
-                    )}
+                    <div className="relative w-full sm:w-60">
+                      <Search className="w-3.5 h-3.5 text-[#71807B] absolute left-3 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        placeholder="Search model or pairing code..."
+                        className="w-full h-8 pl-8 pr-3 text-xs bg-[#F9FAF9] border border-[#E4E9E5] rounded-lg focus:border-[#0A9B70] outline-none"
+                      />
+                    </div>
                   </div>
 
-                  {/* Grid */}
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-                    {devices.map((device) => (
+                    {filteredDevices.map((device) => (
                       <DeviceCard
                         key={device.childId}
                         device={device}
@@ -1671,61 +2005,47 @@ export const App: React.FC = () => {
                       />
                     ))}
                   </div>
-                </div>
+                </>
               )}
             </div>
           )}
 
-          {/* Section 2: Live Location */}
           {currentSection === 'location' && (
             <LiveLocationView
-              devices={devices}
+              devices={liveDevices}
               selectedDevice={selectedDevice}
               onSelectDevice={setSelectedDevice}
             />
           )}
 
-          {/* Section 3: Screen Mirroring */}
           {currentSection === 'mirroring' && (
             <ScreenMirrorView
-              devices={devices}
+              devices={liveDevices}
               selectedDevice={selectedDevice}
               onSelectDevice={setSelectedDevice}
               parentUid={currentUser?.uid || 'parent_console'}
             />
           )}
 
-          {/* Section 4: Live Camera Stream */}
-          {currentSection === 'camera' && selectedDevice && (
-            <LiveCameraModal
-              device={selectedDevice}
-              parentUid={currentUser?.uid || 'parent_console'}
-              onClose={() => setCurrentSection('devices')}
-            />
-          )}
-
-          {/* Section 5: Synced Notifications */}
           {currentSection === 'notifications' && (
             <NotificationsView
-              devices={devices}
+              devices={liveDevices}
               selectedDevice={selectedDevice}
               onSelectDevice={setSelectedDevice}
             />
           )}
 
-          {/* Section 6: Call Logs & History */}
           {currentSection === 'calls' && (
             <CallLogsView
-              devices={devices}
+              devices={liveDevices}
               selectedDevice={selectedDevice}
               onSelectDevice={setSelectedDevice}
             />
           )}
 
-          {/* Section 7: App Usage & Screen Time */}
           {currentSection === 'usage' && (
             <AppUsageView
-              devices={devices}
+              devices={liveDevices}
               selectedDevice={selectedDevice}
               onSelectDevice={setSelectedDevice}
             />
@@ -1733,24 +2053,21 @@ export const App: React.FC = () => {
         </div>
       </div>
 
-      {/* 4-Digit Bind Code Pairing Modal */}
       {isAddChildModalOpen && (
-        <AddChildModal
-          onClose={() => setIsAddChildModalOpen(false)}
-          onPair={handlePairChild}
-        />
+        <AddChildModal onClose={() => setIsAddChildModalOpen(false)} onPair={handlePairChild} />
       )}
 
-      {/* Live Camera Streaming Modal Popup */}
-      {activeStreamingDevice && (
+      {cameraModalDevice && (
         <LiveCameraModal
-          device={activeStreamingDevice}
+          device={cameraModalDevice}
           parentUid={currentUser?.uid || 'parent_console'}
-          onClose={() => setActiveStreamingDevice(null)}
+          onClose={() => {
+            setActiveStreamingDevice(null);
+            if (currentSection === 'camera') setCurrentSection('devices');
+          }}
         />
       )}
 
-      {/* Auth Modal Popup */}
       {isAuthModalOpen && (
         <AuthModal
           onClose={() => setIsAuthModalOpen(false)}
@@ -1764,5 +2081,11 @@ export const App: React.FC = () => {
     </div>
   );
 };
+
+export const App: React.FC = () => (
+  <ConsoleErrorBoundary>
+    <AppContent />
+  </ConsoleErrorBoundary>
+);
 
 export default App;

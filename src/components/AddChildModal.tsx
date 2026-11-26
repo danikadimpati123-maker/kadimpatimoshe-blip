@@ -9,8 +9,7 @@ import {
   Wifi, 
   ShieldCheck,
   ArrowRight,
-  Search,
-  Check
+  Search
 } from 'lucide-react';
 import { ParentChildDevice } from '../types';
 import { searchAndVerifyChildDevice, DeviceVerificationResult } from '../services/firebase';
@@ -29,11 +28,17 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
   const [error, setError] = useState<string | null>(null);
   const [pairedDevice, setPairedDevice] = useState<ParentChildDevice | null>(null);
 
-  // Auto-search when a full code (e.g. FG-XXXXXX or 6 digits) is entered
+  // 1. డిబౌన్స్ లాజిక్ & ఎక్జాక్ట్ 6+ క్యారెక్టర్స్ ఉన్నప్పుడే ఫైర్బేస్ కాల్ వెళ్లేలా ఆటో-సెర్చ్
   useEffect(() => {
     const clean = code.trim().toUpperCase();
+    
+    // కోడ్ కనీసం 6 క్యారెక్టర్లు ఉంటేనే సెర్చ్ ట్రిగ్గర్ అవుతుంది (అనవసరమైన ఫైర్బేస్ కాల్స్ ఆగిపోతాయి)
     if (clean.length >= 6) {
-      handleSearch(clean);
+      const timer = setTimeout(() => {
+        handleSearch(clean);
+      }, 400); // 400ms డిబౌన్స్ టైమర్
+
+      return () => clearTimeout(timer);
     } else {
       setSearchResult(null);
       setError(null);
@@ -45,12 +50,17 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
     setError(null);
     try {
       const result = await searchAndVerifyChildDevice(cleanCode);
+      if (!result || !result.existsInRTDB) {
+        // 2. కస్టమ్ ఎర్రర్ హ్యాండ్లింగ్ (డేటా లేకపోతే)
+        throw new Error('ఈ బైండింగ్ కోడ్తో ఎలాంటి డివైస్ కనెక్ట్ కాలేదు. దయచేసి చైల్డ్ డివైస్లో కోడ్ సరిచూసుకోండి.');
+      }
       setSearchResult(result);
       if (!modelName) {
         setModelName(result.deviceModelName);
       }
     } catch (err: any) {
-      setError(err.message || 'Error searching /devices/' + cleanCode);
+      // యూజర్ ఫ్రెండ్లీ ఎర్రర్ మెసేజ్ చూపించడం
+      setError(err.message || 'ఈ బైండింగ్ కోడ్తో ఎలాంటి డివైస్ కనెక్ట్ కాలేదు. దయచేసి చైల్డ్ డివైస్లో కోడ్ సరిచూసుకోండి.');
       setSearchResult(null);
     } finally {
       setIsSearching(false);
@@ -61,7 +71,7 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
     e.preventDefault();
     const cleanCode = code.trim().toUpperCase();
     if (!cleanCode || cleanCode.length < 6) {
-      setError('Please enter a valid binding code (e.g. FG-XXXXXX).');
+      setError('దయచేసి సరైన 6 అక్షరాల బైండింగ్ కోడ్ (ఉదా. FG-XXXXXX) ఎంటర్ చేయండి.');
       return;
     }
 
@@ -73,7 +83,7 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
       const device = await onPair(cleanCode, finalModelName);
       setPairedDevice(device);
     } catch (err: any) {
-      setError(err.message || 'Could not verify or link device in Firebase RTDB.');
+      setError(err.message || 'ఫైర్బేస్ RTDB లో డివైస్ను లింక్ చేయడం విఫలమైంది. మళ్లీ ప్రయత్నించండి.');
     } finally {
       setIsSubmitting(false);
     }
@@ -98,32 +108,32 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
             <div>
               <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 mb-2">
                 <span className="w-2 h-2 rounded-full bg-emerald-600 animate-pulse"></span>
-                Status: Online / Synced
+                స్థితి: ఆన్లైన్ / సింక్ చేయబడింది
               </span>
               <h3 className="text-xl font-extrabold text-neutral-900">
                 {pairedDevice.deviceModelName || 'Child Device'}
               </h3>
               <p className="text-xs text-neutral-500 mt-1">
-                Verified via <code className="text-neutral-700 font-semibold bg-neutral-100 px-1 py-0.5 rounded">/devices/{pairedDevice.pairingCode}</code> and linked to Parent Console.
+                <code className="text-neutral-700 font-semibold bg-neutral-100 px-1 py-0.5 rounded">/devices/{pairedDevice.pairingCode}</code> ద్వారా వెరిఫై చేయబడి పేరెంట్ కన్సోల్కు లింక్ చేయబడింది.
               </p>
             </div>
 
             <div className="bg-neutral-50 rounded-xl p-3 border border-neutral-200 text-left text-xs space-y-2">
               <div className="flex justify-between items-center">
-                <span className="text-neutral-500 font-medium">Child Device ID:</span>
+                <span className="text-neutral-500 font-medium">చైల్డ్ డివైస్ ID:</span>
                 <span className="font-mono font-bold text-neutral-800">{pairedDevice.childId}</span>
               </div>
               <div className="flex justify-between items-center">
-                <span className="text-neutral-500 font-medium">Firebase RTDB Node:</span>
+                <span className="text-neutral-500 font-medium">Firebase RTDB నోడ్:</span>
                 <span className="font-mono text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200 font-bold">
                   /devices/{pairedDevice.pairingCode}
                 </span>
               </div>
               <div className="flex justify-between items-center">
-                <span className="text-neutral-500 font-medium">Realtime Presence:</span>
+                <span className="text-neutral-500 font-medium">లైవ్ ప్రెజెన్స్:</span>
                 <span className="font-semibold text-emerald-600 flex items-center gap-1">
                   <Wifi className="w-3 h-3" />
-                  Live Synced
+                  లైవ్ సింక్ అయింది
                 </span>
               </div>
             </div>
@@ -132,7 +142,7 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
               onClick={onClose}
               className="w-full py-2.5 rounded-xl font-bold text-xs bg-[#0a9b70] hover:bg-[#087957] text-white transition-colors shadow-xs flex items-center justify-center gap-2"
             >
-              Done & Open in Parent Console
+              పూర్తయింది & కన్సోల్ని తెరవండి
               <ArrowRight className="w-4 h-4" />
             </button>
           </div>
@@ -142,9 +152,9 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
               <div className="w-12 h-12 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center mx-auto mb-2 border border-emerald-100 shadow-xs">
                 <Smartphone className="w-6 h-6" />
               </div>
-              <h3 className="text-xl font-extrabold text-[#202b29]">Add Child Device</h3>
+              <h3 className="text-xl font-extrabold text-[#202b29]">చైల్డ్ డివైస్ని జోడించండి</h3>
               <p className="text-xs text-[#71807b] mt-1">
-                Enter the binding code (e.g. <strong>FG-XXXXXX</strong>) displayed on your child's device. 
+                మీ పిల్లల డివైస్లో కనిపించే బైండింగ్ కోడ్ (ఉదా. <strong>FG-XXXXXX</strong>) ని ఎంటర్ చేయండి.
               </p>
             </div>
 
@@ -158,22 +168,23 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
             <div>
               <div className="flex items-center justify-between mb-1">
                 <label className="text-xs font-bold text-neutral-700">
-                  Child Binding Code (ID)
+                  చైల్డ్ బైండింగ్ కోడ్ (ID)
                 </label>
                 <span className="text-[11px] text-neutral-400">
-                  Example: FG-ABCDEF
+                  ఉదాహరణ: FG-ABCDEF
                 </span>
               </div>
 
               <div className="flex items-center gap-2">
                 <div className="relative flex-1">
+                  {/* 3. ఆటో-క్యాపిటలైజేషన్ (.toUpperCase()) ఇక్కడ వర్తిస్తుంది */}
                   <input
                     type="text"
                     maxLength={12}
                     autoFocus
                     placeholder="FG-ABCDEF"
                     value={code}
-                    onChange={(e) => setCode(e.target.value)}
+                    onChange={(e) => setCode(e.target.value.toUpperCase())}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && code.length >= 6) {
                         e.preventDefault();
@@ -191,13 +202,13 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
 
                 <button
                   type="button"
-                  onClick={() => code.length >= 4 && handleSearch(code.trim().replace(/\D/g, ''))}
+                  onClick={() => code.length >= 4 && handleSearch(code.trim().toUpperCase())}
                   disabled={isSearching || code.length < 4}
                   className="h-12 px-4 rounded-xl border border-neutral-300 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 font-bold text-xs flex items-center gap-1.5 transition-colors disabled:opacity-40 shrink-0"
                   title="Search Firebase RTDB /devices/{pairingCode}"
                 >
                   <Search className="w-3.5 h-3.5 text-neutral-500" />
-                  Search RTDB
+                  సెర్చ్ RTDB
                 </button>
               </div>
             </div>
@@ -208,25 +219,25 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
                 <div className="flex items-center justify-between">
                   <span className="font-bold text-emerald-900 flex items-center gap-1.5">
                     <Database className="w-4 h-4 text-emerald-700 shrink-0" />
-                    Verified: {searchResult.rtdbPath}
+                    వెరిఫై అయింది: {searchResult.rtdbPath}
                   </span>
                   <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-200 text-emerald-900 flex items-center gap-1">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-pulse"></span>
-                    Ready to Sync
+                    సింక్ చేయడానికి సిద్ధంగా ఉంది
                   </span>
                 </div>
                 <div className="text-neutral-700 space-y-1 pt-1 border-t border-emerald-200/60 text-[11px]">
                   <div className="flex justify-between">
-                    <span className="text-neutral-500">Device Model:</span>
+                    <span className="text-neutral-500">డివైస్ మోడల్:</span>
                     <span className="font-bold text-neutral-900">{searchResult.deviceModelName}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-neutral-500">Firebase Node:</span>
+                    <span className="text-neutral-500">ఫైర్బేస్ నోడ్:</span>
                     <span className="font-mono text-emerald-800 font-semibold">{searchResult.rtdbPath}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-neutral-500">Pairing Status:</span>
-                    <span className="capitalize font-semibold text-emerald-700">Online & Ready to Link</span>
+                    <span className="text-neutral-500">పేరింగ్ స్థితి:</span>
+                    <span className="capitalize font-semibold text-emerald-700">ఆన్లైన్ & లింక్ చేయడానికి సిద్ధం</span>
                   </div>
                 </div>
               </div>
@@ -234,11 +245,11 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
 
             <div>
               <label className="block text-xs font-bold text-neutral-700 mb-1">
-                Custom Child Label (Optional)
+                కస్టమ్ చైల్డ్ లేబుల్ (ఐచ్ఛికం)
               </label>
               <input
                 type="text"
-                placeholder={searchResult?.deviceModelName || "e.g. Liam's Phone"}
+                placeholder={searchResult?.deviceModelName || "ఉదా. Liam's Phone"}
                 value={modelName}
                 onChange={(e) => setModelName(e.target.value)}
                 className="w-full h-10 px-3 text-xs bg-neutral-50 border border-[#e4e9e5] rounded-xl focus:border-[#0a9b70] focus:ring-2 focus:ring-emerald-100 outline-none text-neutral-900"
@@ -254,19 +265,19 @@ export const AddChildModal: React.FC<AddChildModalProps> = ({ onClose, onPair })
                 {isSubmitting ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Linking /devices/{code} to Console…
+                    కన్సోల్కు లింక్ అవుతోంది...
                   </>
                 ) : (
                   <>
                     <ShieldCheck className="w-4 h-4" />
-                    Verify & Link Device {code ? `(${code})` : ''}
+                    వెరిఫై చేసి లింక్ చేయండి {code ? `(${code})` : ''}
                   </>
                 )}
               </button>
             </div>
 
             <div className="pt-2 border-t border-neutral-100 text-[11px] text-neutral-400 text-center leading-normal">
-              Queries Firebase RTDB <code className="text-neutral-600 bg-neutral-100 px-1 rounded">/devices/{code || '3819'}</code>, verifies child presence, and updates status to <strong>Online/Synced</strong>.
+              Firebase RTDB <code className="text-neutral-600 bg-neutral-100 px-1 rounded">/devices/{code || 'FG-XXXXXX'}</code> ను క్వెరీ చేసి, చైల్డ్ ప్రెజెన్స్ను వెరిఫై చేసి ఆన్లైన్కి అప్డేట్ చేస్తుంది.
             </div>
           </form>
         )}

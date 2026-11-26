@@ -39,7 +39,7 @@ class GeofenceBroadcastReceiver : BroadcastReceiver() {
 
         if (eventType == null) return
 
-        val db = FirebaseDatabase.getInstance().reference
+        val db = FirebaseDatabase.getInstance("https://kidguard-3b499-default-rtdb.asia-southeast1.firebasedatabase.app").reference
         val deviceCode = getDeviceCode(context)
 
         for (geofence in triggerGeofences) {

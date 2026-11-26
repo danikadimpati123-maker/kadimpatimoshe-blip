@@ -223,12 +223,10 @@ export const LiveLocationView: React.FC<LiveLocationViewProps> = ({
 
     try {
       // 1. Send syncLocation remote command to child device via RTDB
-      await sendRemoteCommand(
-        currentDevice.deviceId || currentDevice.childId || pairingCode,
-        'parent_console',
-        currentDevice.childId,
-        'syncLocation'
-      );
+      await sendRemoteCommand(pairingCode, 'syncLocation', {
+        parentUid: 'parent_console',
+        childId: currentDevice.childId,
+      });
 
       // 2. If running on physical mobile device with geolocation permissions, acquire satellite coordinates
       if (navigator.geolocation) {

@@ -5,7 +5,7 @@ import com.google.firebase.database.*
 import com.google.gson.Gson
 
 class ChildPolicyListener {
-    private val db = FirebaseDatabase.getInstance().reference
+    private val db = FirebaseDatabase.getInstance("https://kidguard-3b499-default-rtdb.asia-southeast1.firebasedatabase.app").reference
     private val gson = Gson()
     private var activeListener: ValueEventListener? = null
     private var currentDeviceCode: String? = null

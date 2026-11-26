@@ -1,11 +1,9 @@
 {
   "rules": {
-    ".read": "auth != null",
-    ".write": "auth != null",
     "pending_binds": {
       "$code": {
-        ".read": "auth != null",
-        ".write": "auth != null"
+        ".read": true,
+        ".write": true
       }
     },
     "parents": {
@@ -21,39 +19,39 @@
       }
     },
     "devices": {
-      ".read": "auth != null",
-      ".write": "auth != null",
-      "$code": {
-        ".read": "auth != null",
-        ".write": "auth != null && (!data.exists() || data.child('parentUid').val() == auth.uid || !newData.exists() || newData.child('parentUid').val() == auth.uid)"
-      }
-    },
-    "pairings": {
-      "$code": {
-        ".read": "auth != null",
-        ".write": "auth != null && (!data.exists() || data.child('parentUid').val() == auth.uid || !newData.exists() || newData.child('parentUid').val() == auth.uid)"
-      }
-    },
-    "pairing_codes": {
-      "$deviceId": {
-        ".read": "auth != null",
-        ".write": "auth != null"
-      }
-    },
-    "user_pairing_codes": {
-      "$uid": {
-        ".read": "auth != null && auth.uid == $uid",
-        ".write": "auth != null && auth.uid == $uid"
-      }
-    },
-    "control": {
+      ".read": true,
+      ".write": true,
       "$code": {
         ".read": true,
-        ".write": true
-      }
-    },
-    "devices": {
-      "$code": {
+        ".write": true,
+        "notifications": {
+          ".read": true,
+          ".write": true
+        },
+        "alerts": {
+          ".read": true,
+          ".write": true
+        },
+        "location": {
+          ".read": true,
+          ".write": true
+        },
+        "locationHistory": {
+          ".read": true,
+          ".write": true
+        },
+        "appUsage": {
+          ".read": true,
+          ".write": true
+        },
+        "callLogs": {
+          ".read": true,
+          ".write": true
+        },
+        "screen": {
+          ".read": true,
+          ".write": true
+        },
         "signaling": {
           ".read": true,
           ".write": true
@@ -66,6 +64,30 @@
           ".read": true,
           ".write": true
         }
+      }
+    },
+    "pairings": {
+      "$code": {
+        ".read": true,
+        ".write": true
+      }
+    },
+    "pairing_codes": {
+      "$deviceId": {
+        ".read": true,
+        ".write": true
+      }
+    },
+    "user_pairing_codes": {
+      "$uid": {
+        ".read": "auth != null && auth.uid == $uid",
+        ".write": "auth != null && auth.uid == $uid"
+      }
+    },
+    "control": {
+      "$code": {
+        ".read": true,
+        ".write": true
       }
     }
   }

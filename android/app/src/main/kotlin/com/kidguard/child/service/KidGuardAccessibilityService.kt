@@ -3,33 +3,35 @@ package com.kidguard.child.service
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.util.Log
+import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import com.google.firebase.database.DataSnapshot
-import com.google.firebase.database.DatabaseError
-import com.google.firebase.database.DatabaseReference
-import com.google.firebase.database.FirebaseDatabase
-import com.google.firebase.database.ServerValue
-import com.google.firebase.database.ValueEventListener
-import com.kidguard.child.usage.UsageStatsCollector
+import com.google.firebase.database.*
 import com.kidguard.child.geofence.GeofenceManager
+import com.kidguard.child.security.DeviceControlManager
+import com.kidguard.child.usage.UsageStatsCollector
+import java.util.Calendar
 
 class KidGuardAccessibilityService : AccessibilityService() {
 
-    private val db: DatabaseReference = FirebaseDatabase.getInstance().reference
+    private val db: DatabaseReference =
+        FirebaseDatabase.getInstance("https://kidguard-3b499-default-rtdb.asia-southeast1.firebasedatabase.app").reference
+
     private lateinit var usageStatsCollector: UsageStatsCollector
     private lateinit var geofenceManager: GeofenceManager
 
-    // Local cached variables to avoid heavy database reads on every window state change
-    private var isAppLockEnabled: Boolean = false
-    private var isWebFilterEnabled: Boolean = false
-    private var isBedtimeEnabled: Boolean = false
-    private var dailyScreenTimeLimitMs: Long = 0 // 0 means no limit
-    private var bedtimeStartHour: Int = 22 // Default 10 PM
-    private var bedtimeEndHour: Int = 6    // Default 6 AM
+    private var isAppLockEnabled = false
+    private var isWebFilterEnabled = false
+    private var isBedtimeEnabled = false
+    private var dailyScreenTimeLimitMs = 0L
+    private var bedtimeStartHour = 22
+    private var bedtimeEndHour = 6
     private var blockedAppsList: Set<String> = emptySet()
     private var blockedDomains: Set<String> = setOf("adultsite.com", "badcontent.com", "phishing.net")
     private var policyListener: ValueEventListener? = null
+    private var controlListener: ValueEventListener? = null
+    private val alertTimestamps = mutableMapOf<String, Long>()
 
     companion object {
         private const val TAG = "KidGuardAccessibility"
@@ -37,14 +39,7 @@ class KidGuardAccessibilityService : AccessibilityService() {
         const val EXTRA_BLOCKED_PACKAGE = "blocked_package"
         private const val PREFS_NAME = "kidguard_prefs"
         private const val KEY_PAIRING_CODE = "pairing_code"
-        private const val KEY_BLOCKED_APPS = "blocked_packages"
-        private const val KEY_BLOCKED_DOMAINS = "blocked_domains"
-        private const val KEY_APP_LOCK_ENABLED = "app_lock_enabled"
-        private const val KEY_WEB_FILTER_ENABLED = "web_filter_enabled"
-        private const val KEY_BEDTIME_ENABLED = "bedtime_enabled"
-        private const val KEY_SCREEN_TIME_LIMIT = "screen_time_limit"
-        private const val KEY_BEDTIME_START = "bedtime_start"
-        private const val KEY_BEDTIME_END = "bedtime_end"
+        private const val COOLDOWN_MS = 15_000L
     }
 
     override fun onCreate() {
@@ -55,143 +50,89 @@ class KidGuardAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Log.d(TAG, "Accessibility service connected successfully.")
         loadLocalPolicyCache()
         startListeningToPolicy()
     }
 
-    /**
-     * Loads locally cached policy as an offline safeguard.
-     */
-    private fun loadLocalPolicyCache() {
-        try {
-            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            isAppLockEnabled = prefs.getBoolean(KEY_APP_LOCK_ENABLED, false)
-            isWebFilterEnabled = prefs.getBoolean(KEY_WEB_FILTER_ENABLED, false)
-            isBedtimeEnabled = prefs.getBoolean(KEY_BEDTIME_ENABLED, false)
-            dailyScreenTimeLimitMs = prefs.getLong(KEY_SCREEN_TIME_LIMIT, 0)
-            bedtimeStartHour = prefs.getInt(KEY_BEDTIME_START, 22)
-            bedtimeEndHour = prefs.getInt(KEY_BEDTIME_END, 6)
-            blockedAppsList = prefs.getStringSet(KEY_BLOCKED_APPS, emptySet()) ?: emptySet()
-            blockedDomains = prefs.getStringSet(KEY_BLOCKED_DOMAINS, blockedDomains) ?: blockedDomains
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed loading local policy cache: ${e.message}")
-        }
-    }
+    private fun loadLocalPolicyCache() = runCatching {
+        val p = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        isAppLockEnabled = p.getBoolean("app_lock_enabled", false)
+        isWebFilterEnabled = p.getBoolean("web_filter_enabled", false)
+        isBedtimeEnabled = p.getBoolean("bedtime_enabled", false)
+        dailyScreenTimeLimitMs = p.getLong("screen_time_limit", 0L)
+        bedtimeStartHour = p.getInt("bedtime_start", 22)
+        bedtimeEndHour = p.getInt("bedtime_end", 6)
+        blockedAppsList = p.getStringSet("blocked_packages", emptySet()).orEmpty()
+        blockedDomains = p.getStringSet("blocked_domains", blockedDomains) ?: blockedDomains
+    }.onFailure { Log.e(TAG, "Cache load error: ${it.message}") }
 
-    /**
-     * Real-time listener to sync policy and blocked apps from Firebase RTDB efficiently.
-     */
     private fun startListeningToPolicy() {
-        val deviceCode = getDeviceCode()
-        if (deviceCode.isBlank()) return
+        val code = getDeviceCode()
+        if (code.isBlank()) return
 
         policyListener = object : ValueEventListener {
-            override fun onDataChange(snapshot: DataSnapshot) {
-                try {
-                    isAppLockEnabled = snapshot.child("appLockEnabled").getValue(Boolean::class.java) ?: false
-                    isWebFilterEnabled = snapshot.child("webFilterEnabled").getValue(Boolean::class.java) ?: false
-                    isBedtimeEnabled = snapshot.child("bedtimeEnabled").getValue(Boolean::class.java) ?: false
-                    dailyScreenTimeLimitMs = snapshot.child("dailyScreenTimeLimitMs").getValue(Long::class.java) ?: 0L
-                    bedtimeStartHour = snapshot.child("bedtimeStartHour").getValue(Int::class.java) ?: 22
-                    bedtimeEndHour = snapshot.child("bedtimeEndHour").getValue(Int::class.java) ?: 6
-                    
-                    // Sync Blocked Apps
-                    val blockedSnapshot = snapshot.child("blockedApps")
-                    blockedAppsList = parseSet(blockedSnapshot)
+            override fun onDataChange(snap: DataSnapshot) = runCatching {
+                isAppLockEnabled = snap.child("appLockEnabled").getValue(Boolean::class.java) ?: false
+                isWebFilterEnabled = snap.child("webFilterEnabled").getValue(Boolean::class.java) ?: false
+                isBedtimeEnabled = snap.child("bedtimeEnabled").getValue(Boolean::class.java) ?: false
+                dailyScreenTimeLimitMs = snap.child("dailyScreenTimeLimitMs").getValue(Long::class.java) ?: 0L
+                bedtimeStartHour = snap.child("bedtimeStartHour").getValue(Int::class.java) ?: 22
+                bedtimeEndHour = snap.child("bedtimeEndHour").getValue(Int::class.java) ?: 6
+                blockedAppsList = parseSet(snap.child("blockedApps"))
+                if (snap.child("blockedDomains").exists()) blockedDomains = parseSet(snap.child("blockedDomains"))
 
-                    // Sync Blocked Domains
-                    val domainSnapshot = snapshot.child("blockedDomains")
-                    if (domainSnapshot.exists()) {
-                        blockedDomains = parseSet(domainSnapshot)
-                    }
-
-                    // Persist to local cache for offline resiliency
-                    getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                        .edit()
-                        .putBoolean(KEY_APP_LOCK_ENABLED, isAppLockEnabled)
-                        .putBoolean(KEY_WEB_FILTER_ENABLED, isWebFilterEnabled)
-                        .putBoolean(KEY_BEDTIME_ENABLED, isBedtimeEnabled)
-                        .putLong(KEY_SCREEN_TIME_LIMIT, dailyScreenTimeLimitMs)
-                        .putBoolean(KEY_KEYWORD_ALERTS_ENABLED, snapshot.child("keywordAlertsEnabled").getValue(Boolean::class.java) ?: true)
-                        .putStringSet(KEY_WATCH_KEYWORDS, parseSet(snapshot.child("watchKeywords")).ifEmpty { setOf("badword1", "badword2", "suicide", "drugs", "porn") })
-                        .putInt(KEY_BEDTIME_START, bedtimeStartHour)
-                        .putInt(KEY_BEDTIME_END, bedtimeEndHour)
-                        .putStringSet(KEY_BLOCKED_APPS, blockedAppsList)
-                        .putStringSet(KEY_BLOCKED_DOMAINS, blockedDomains)
-                        .apply()
-                    
-                    // Sync Geofences
-                    val safeZonesSnapshot = snapshot.child("safeZones")
-                    if (safeZonesSnapshot.exists()) {
-                        syncGeofences(safeZonesSnapshot)
-                    }
-                    
-                    Log.d(TAG, "Policy synced: Apps=${blockedAppsList.size}, Bedtime=$bedtimeStartHour-$bedtimeEndHour")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error parsing policy update: ${e.message}")
+                val keywords = parseSet(snap.child("watchKeywords")).ifEmpty {
+                    setOf("suicide", "drugs", "porn", "weapon", "meet me")
                 }
-            }
 
-            override fun onCancelled(error: DatabaseError) {
-                Log.e(TAG, "Policy sync cancelled: ${error.message}")
-            }
+                getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                    .putBoolean("app_lock_enabled", isAppLockEnabled)
+                    .putBoolean("web_filter_enabled", isWebFilterEnabled)
+                    .putBoolean("bedtime_enabled", isBedtimeEnabled)
+                    .putLong("screen_time_limit", dailyScreenTimeLimitMs)
+                    .putBoolean("keyword_alerts_enabled", snap.child("keywordAlertsEnabled").getValue(Boolean::class.java) ?: true)
+                    .putStringSet("watch_keywords", keywords)
+                    .putInt("bedtime_start", bedtimeStartHour)
+                    .putInt("bedtime_end", bedtimeEndHour)
+                    .putStringSet("blocked_packages", blockedAppsList)
+                    .putStringSet("blocked_domains", blockedDomains)
+                    .apply()
+
+                if (snap.child("safeZones").exists()) syncGeofences(snap.child("safeZones"))
+            }.onFailure { Log.e(TAG, "Policy parse error: ${it.message}") }.let {}
+
+            override fun onCancelled(error: DatabaseError) = Log.e(TAG, "Policy cancelled: ${error.message}")
         }
 
-        db.child("devices").child(deviceCode).child("policy")
-            .addValueEventListener(policyListener!!)
+        db.child("devices/$code/policy").addValueEventListener(policyListener!!)
 
-        // Presence & Heartbeat logic
-        val presenceRef = db.child("devices").child(deviceCode).child("presence")
-        presenceRef.child("online").setValue(true)
-        presenceRef.child("online").onDisconnect().setValue(false)
-        presenceRef.child("lastSeen").setValue(ServerValue.TIMESTAMP)
-        presenceRef.child("lastSeen").onDisconnect().setValue(ServerValue.TIMESTAMP)
+        val presence = db.child("devices/$code/presence")
+        presence.child("online").setValue(true)
+        presence.child("online").onDisconnect().setValue(false)
+        presence.child("lastSeen").setValue(ServerValue.TIMESTAMP)
+        presence.child("lastSeen").onDisconnect().setValue(ServerValue.TIMESTAMP)
 
-        // Listen for remote control commands (startStream, startScreenShare, etc.)
-        startListeningToControlCommands()
+        startListeningToControlCommands(code)
+    }
 
-    private fun startListeningToControlCommands() {
-        val deviceCode = getDeviceCode()
-        if (deviceCode.isBlank()) return
+    private fun startListeningToControlCommands(code: String) {
+        controlListener = object : ValueEventListener {
+            override fun onDataChange(snap: DataSnapshot) {
+                val cmd = snap.child("command").getValue(String::class.java) ?: return
+                if (snap.child("acknowledged").getValue(Boolean::class.java) == true) return
 
-        db.child("devices").child(deviceCode).child("control")
-            .addValueEventListener(object : ValueEventListener {
-                override fun onDataChange(snapshot: DataSnapshot) {
-                    val command = snapshot.child("command").getValue(String::class.java) ?: return
-                    val commandId = snapshot.child("commandId").getValue(String::class.java) ?: ""
-                    val acknowledged = snapshot.child("acknowledged").getValue(Boolean::class.java) ?: false
-
-                    if (acknowledged) return // Skip already processed commands
-
-                    Log.i(TAG, "Received Remote Command: $command (ID: $commandId)")
-
-                    when (command) {
-                        "startStream" -> {
-                            val facing = snapshot.child("cameraFacing").getValue(String::class.java) ?: "back"
-                            startWebRTCService("camera", facing)
-                        }
-                        "startScreenShare" -> {
-                            // Screen share usually needs a separate intent for permission result
-                            // But for now we try to start the service
-                            startWebRTCService("screen")
-                        }
-                        "stopStream", "stopScreenShare" -> {
-                            stopWebRTCService()
-                        }
-                        "lockDevice" -> {
-                            com.kidguard.child.security.DeviceControlManager(this@KidGuardAccessibilityService).lockDevice()
-                        }
-                    }
-
-                    // Acknowledge the command
-                    db.child("devices").child(deviceCode).child("control").child("acknowledged").setValue(true)
+                when (cmd) {
+                    "startStream" -> startWebRTCService("camera", snap.child("cameraFacing").getValue(String::class.java) ?: "back")
+                    "startScreenShare" -> startWebRTCService("screen")
+                    "stopStream", "stopScreenShare" -> stopWebRTCService()
+                    "lockDevice" -> DeviceControlManager(this@KidGuardAccessibilityService).lockDevice()
                 }
+                db.child("devices/$code/control/acknowledged").setValue(true)
+            }
 
-                override fun onCancelled(error: DatabaseError) {
-                    Log.e(TAG, "Control command listener cancelled: ${error.message}")
-                }
-            })
+            override fun onCancelled(error: DatabaseError) = Log.e(TAG, "Control cancelled: ${error.message}")
+        }
+        db.child("devices/$code/control").addValueEventListener(controlListener!!)
     }
 
     private fun startWebRTCService(type: String, facing: String = "back") {
@@ -200,239 +141,143 @@ class KidGuardAccessibilityService : AccessibilityService() {
             putExtra(WebRTCSignalingService.EXTRA_TYPE, type)
             putExtra(WebRTCSignalingService.EXTRA_FACING, facing)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
     }
 
     private fun stopWebRTCService() {
-        val intent = Intent(this, WebRTCSignalingService::class.java).apply {
-            action = WebRTCSignalingService.ACTION_STOP
-        }
-        startService(intent)
+        startService(Intent(this, WebRTCSignalingService::class.java).apply { action = WebRTCSignalingService.ACTION_STOP })
     }
 
-    private fun parseSet(snapshot: DataSnapshot): Set<String> {
-        val rawMap = snapshot.value as? Map<*, *>
-        return if (rawMap != null) {
-            rawMap.keys.map { it.toString() }.toSet()
-        } else if (snapshot.value is List<*>) {
-            (snapshot.value as List<*>).mapNotNull { it?.toString() }.toSet()
-        } else {
-            emptySet()
-        }
+    private fun parseSet(snap: DataSnapshot): Set<String> = when (val v = snap.value) {
+        is Map<*, *> -> v.keys.map { it.toString() }.toSet()
+        is List<*> -> v.mapNotNull { it?.toString() }.toSet()
+        else -> emptySet()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
+        val pkg = event?.packageName?.toString() ?: return
+        val type = event.eventType
 
-        val packageName = event.packageName?.toString() ?: return
-        
-        // 1. App Blocker & Screen Time Logic
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            handleAppBlocking(packageName)
-        }
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) handleAppBlocking(pkg)
 
-        // 2. Web Filter Logic (Inspects URL bars and content for browsers)
-        if (isWebFilterEnabled && (
-            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED || 
-            event.eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED ||
-            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED)
+        if (isWebFilterEnabled && type in listOf(
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
+                AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            ) && listOf("com.android.chrome", "org.mozilla.firefox", "com.microsoft.emmx", "com.opera.browser").any(pkg::startsWith)
         ) {
-            // Limited to common browser packages to save CPU
-            val browsers = listOf("com.android.chrome", "org.mozilla.firefox", "com.microsoft.emmx", "com.opera.browser")
-            if (browsers.any { packageName.startsWith(it) }) {
-                checkAndBlockUrl(rootInActiveWindow)
+            scanNodes(rootInActiveWindow) { text ->
+                if (blockedDomains.any { text.contains(it.lowercase()) }) {
+                    launchHomeScreen()
+                    broadcastBlockedEvent("browser", "web_filter")
+                    true
+                } else false
             }
         }
 
-        // 3. Keyword / Bad Words Detection (Monitoring Chats/Inputs)
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        if (prefs.getBoolean(KEY_KEYWORD_ALERTS_ENABLED, true)) {
-            val keywords = prefs.getStringSet(KEY_WATCH_KEYWORDS, emptySet()) ?: emptySet()
-            if (keywords.isNotEmpty()) {
-                scanForKeywords(rootInActiveWindow, keywords)
+        if (prefs.getBoolean("keyword_alerts_enabled", true) && type in listOf(
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+                AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED
+            )
+        ) {
+            val words = prefs.getStringSet("watch_keywords", emptySet()).orEmpty()
+            if (words.isNotEmpty()) {
+                scanNodes(rootInActiveWindow) { text ->
+                    val now = System.currentTimeMillis()
+                    if (alertTimestamps.size > 100) alertTimestamps.clear()
+                    words.forEach { raw ->
+                        val w = raw.trim()
+                        val key = w.lowercase()
+                        if (w.isNotEmpty() &&
+                            now - (alertTimestamps[key] ?: 0L) >= COOLDOWN_MS &&
+                            Regex("\\b${Regex.escape(w)}\\b", RegexOption.IGNORE_CASE).containsMatchIn(text)
+                        ) {
+                            alertTimestamps[key] = now
+                            reportKeywordMatch(w, text)
+                        }
+                    }
+                    false
+                }
             }
         }
     }
 
-    private fun scanForKeywords(node: AccessibilityNodeInfo?, keywords: Set<String>) {
+    private fun scanNodes(node: AccessibilityNodeInfo?, stopOnMatch: (String) -> Boolean) {
         if (node == null) return
-        try {
+        runCatching {
             val text = (node.text?.toString() ?: node.contentDescription?.toString() ?: "").lowercase()
-            if (text.isNotBlank()) {
-                for (word in keywords) {
-                    if (text.contains(word.lowercase())) {
-                        Log.w(TAG, "Keyword Detected: $word in text: $text")
-                        reportKeywordMatch(word, text)
-                        // We don't return here because we want to scan the whole tree
-                    }
-                }
-            }
-            for (i in 0 until node.childCount) {
-                scanForKeywords(node.getChild(i), keywords)
-            }
-        } catch (e: Exception) {}
+            if (text.isNotBlank() && stopOnMatch(text)) return
+            for (i in 0 until node.childCount) scanNodes(node.getChild(i), stopOnMatch)
+        }
     }
 
     private fun reportKeywordMatch(keyword: String, contextText: String) {
-        val deviceCode = getDeviceCode()
-        val alert = mapOf(
-            "type" to "keyword_alert",
-            "keyword" to keyword,
-            "context" to contextText,
-            "timestamp" to com.google.firebase.database.ServerValue.TIMESTAMP
+        val code = getDeviceCode()
+        if (code.isBlank()) return
+        db.child("devices/$code/alerts").push().setValue(
+            mapOf("type" to "keyword_alert", "keyword" to keyword, "context" to contextText, "timestamp" to ServerValue.TIMESTAMP)
         )
-        db.child("devices").child(deviceCode).child("alerts").push().setValue(alert)
     }
 
-    private fun syncGeofences(snapshot: DataSnapshot) {
-        val activeZones = mutableListOf<String>()
-        for (zoneSnap in snapshot.children) {
-            val id = zoneSnap.key ?: continue
-            val lat = zoneSnap.child("lat").getValue(Double::class.java) ?: continue
-            val lon = zoneSnap.child("lon").getValue(Double::class.java) ?: continue
-            val radius = zoneSnap.child("radiusMeters").getValue(Float::class.java) ?: 200f
-            
+    private fun syncGeofences(snap: DataSnapshot) {
+        for (z in snap.children) {
+            val id = z.key ?: continue
+            val lat = z.child("lat").getValue(Double::class.java) ?: continue
+            val lon = z.child("lon").getValue(Double::class.java) ?: continue
+            val radius = z.child("radiusMeters").getValue(Float::class.java) ?: 200f
             geofenceManager.registerZone(id, lat, lon, radius)
-            activeZones.add(id)
         }
-        // Ideally we would remove old zones not in activeZones, 
-        // but GeofenceManager.registerZone overwrites by ID.
     }
 
-    private fun handleAppBlocking(packageName: String) {
-        if (packageName.isBlank()) return
-        
-        // NEVER block essential system components or our own app
-        if (packageName == this.packageName || 
-            packageName.contains("launcher") || 
-            packageName.contains("systemui") ||
-            packageName == "android" ||
-            packageName == "com.google.android.packageinstaller" ||
-            packageName == "com.android.settings") {
-            return
-        }
+    private fun handleAppBlocking(pkg: String) {
+        if (pkg.isBlank() || pkg == packageName || pkg.contains("launcher", true) || pkg.contains("systemui", true) ||
+            pkg in setOf("android", "com.google.android.packageinstaller", "com.android.settings")
+        ) return
 
-        // Check 1: Manual App Lock
-        if (isAppLockEnabled && blockedAppsList.contains(packageName)) {
-            Log.w(TAG, "App Locked: $packageName. Redirecting to home.")
-            launchHomeScreen()
-            broadcastBlockedEvent(packageName, "app_lock")
-            return
-        }
-
-        // Check 2: Daily Screen Time Limit
-        if (dailyScreenTimeLimitMs > 0) {
-            if (usageStatsCollector.isDailyLimitExceeded(dailyScreenTimeLimitMs)) {
-                Log.w(TAG, "Screen Time Limit Exceeded. Blocking $packageName.")
-                launchHomeScreen()
-                broadcastBlockedEvent(packageName, "screen_time_limit")
-                return
+        when {
+            isAppLockEnabled && blockedAppsList.contains(pkg) -> {
+                launchHomeScreen(); broadcastBlockedEvent(pkg, "app_lock")
+            }
+            dailyScreenTimeLimitMs > 0 && usageStatsCollector.isDailyLimitExceeded(dailyScreenTimeLimitMs) -> {
+                launchHomeScreen(); broadcastBlockedEvent(pkg, "screen_time_limit")
+            }
+            isBedtimeEnabled && isBedtimeActive() -> {
+                launchHomeScreen(); broadcastBlockedEvent(pkg, "bedtime")
             }
         }
-
-        // Check 3: Bedtime Mode (FlashGet Kids feature parity)
-        if (isBedtimeEnabled && isBedtimeActive()) {
-            Log.w(TAG, "Bedtime Active. Blocking $packageName.")
-            launchHomeScreen()
-            broadcastBlockedEvent(packageName, "bedtime")
-        }
     }
 
-    /**
-     * Checks if current time is within the bedtime range.
-     */
     private fun isBedtimeActive(): Boolean {
-        val calendar = java.util.Calendar.getInstance()
-        val currentHour = calendar.get(java.util.Calendar.HOUR_OF_DAY)
-        val currentMinute = calendar.get(java.util.Calendar.MINUTE)
-        val currentTimeInMinutes = currentHour * 60 + currentMinute
-
-        val startMinutes = bedtimeStartHour * 60
-        val endMinutes = bedtimeEndHour * 60
-
-        return if (startMinutes > endMinutes) {
-            // Overlap midnight (e.g., 10 PM to 6 AM)
-            currentTimeInMinutes >= startMinutes || currentTimeInMinutes <= endMinutes
-        } else {
-            // Same day (e.g., 1 PM to 3 PM)
-            currentTimeInMinutes in startMinutes..endMinutes
-        }
+        val cal = Calendar.getInstance()
+        val now = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        val start = bedtimeStartHour * 60
+        val end = bedtimeEndHour * 60
+        return if (start > end) now >= start || now <= end else now in start..end
     }
 
-    /**
-     * Inspects accessibility nodes recursively to find and block restricted URLs.
-     */
-    private fun checkAndBlockUrl(node: AccessibilityNodeInfo?) {
-        if (node == null) return
-        
-        try {
-            // Check text or description for blocked keywords/domains
-            val text = (node.text?.toString() ?: node.contentDescription?.toString() ?: "").lowercase()
-            
-            if (text.isNotBlank()) {
-                for (domain in blockedDomains) {
-                    if (text.contains(domain)) {
-                        Log.w(TAG, "Web Filter: Blocked domain detected ($text). Blocking access.")
-                        launchHomeScreen()
-                        broadcastBlockedEvent("browser", "web_filter")
-                        return
-                    }
-                }
-            }
+    private fun broadcastBlockedEvent(pkg: String, reason: String) = runCatching {
+        sendBroadcast(Intent(ACTION_APP_BLOCKED).setPackage(packageName).putExtra(EXTRA_BLOCKED_PACKAGE, pkg).putExtra("reason", reason))
+    }.onFailure { Log.e(TAG, "Broadcast error: ${it.message}") }.let {}
 
-            // Recurse children
-            for (i in 0 until node.childCount) {
-                checkAndBlockUrl(node.getChild(i))
-            }
-        } catch (e: Exception) {
-            // Ignore node state exceptions
-        }
-    }
-
-    private fun broadcastBlockedEvent(packageName: String, reason: String) {
-        try {
-            val broadcast = Intent(ACTION_APP_BLOCKED).apply {
-                putExtra(EXTRA_BLOCKED_PACKAGE, packageName)
-                putExtra("reason", reason)
-            }
-            sendBroadcast(broadcast)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to broadcast app blocked event: ${e.message}")
-        }
-    }
-
-    override fun onInterrupt() {
-        Log.d(TAG, "Accessibility service interrupted.")
-    }
+    override fun onInterrupt() = Log.d(TAG, "Accessibility service interrupted.")
 
     override fun onDestroy() {
         super.onDestroy()
-        policyListener?.let {
-            val deviceCode = getDeviceCode()
-            if (deviceCode.isNotBlank()) {
-                db.child("devices").child(deviceCode).child("policy").removeEventListener(it)
-            }
+        val code = getDeviceCode()
+        if (code.isNotBlank()) {
+            policyListener?.let { db.child("devices/$code/policy").removeEventListener(it) }
+            controlListener?.let { db.child("devices/$code/control").removeEventListener(it) }
         }
     }
 
-    private fun launchHomeScreen() {
-        try {
-            val intent = Intent(Intent.ACTION_MAIN).apply {
-                addCategory(Intent.CATEGORY_HOME)
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            }
-            startActivity(intent)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch home screen: ${e.message}")
-        }
-    }
+    private fun launchHomeScreen() = runCatching {
+        startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).setFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP))
+    }.onFailure { Log.e(TAG, "Home launch error: ${it.message}") }.let {}
 
     private fun getDeviceCode(): String {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getString(KEY_PAIRING_CODE, null)?.takeIf { it.isNotBlank() } ?: "DEVICE_ABC123"
+        val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_PAIRING_CODE, null)
+            ?: getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE).getString("flutter.pairing_code", null)
+        return raw?.trim()?.uppercase().orEmpty()
     }
 }

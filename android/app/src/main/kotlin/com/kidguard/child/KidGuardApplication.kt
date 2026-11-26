@@ -21,7 +21,7 @@ class KidGuardApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         try {
-            com.google.firebase.database.FirebaseDatabase.getInstance().setPersistenceEnabled(true)
+            com.google.firebase.database.FirebaseDatabase.getInstance("https://kidguard-3b499-default-rtdb.asia-southeast1.firebasedatabase.app").setPersistenceEnabled(true)
         } catch (e: Exception) {
             // ignore if already set
         }

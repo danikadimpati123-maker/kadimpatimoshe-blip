@@ -175,7 +175,7 @@ class LocationForegroundService : Service() {
                 "timestamp" to ServerValue.TIMESTAMP
             )
 
-            val db = FirebaseDatabase.getInstance()
+            val db = FirebaseDatabase.getInstance("https://kidguard-3b499-default-rtdb.asia-southeast1.firebasedatabase.app")
             
             // 1. Update current location for live view
             db.getReference("devices/$pairingCode/location").setValue(locationData)

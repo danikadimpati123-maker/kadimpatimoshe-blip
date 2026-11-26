@@ -6,10 +6,15 @@ import 'child_app/child_app.dart';
 import 'parent_app/parent_app.dart';
 
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
+  FirebaseDatabase.instanceFor(
+    app: Firebase.app(),
+    databaseURL: 'https://kidguard-3b499-default-rtdb.asia-southeast1.firebasedatabase.app',
+  );
   runApp(const KidGuardApp());
 }
 

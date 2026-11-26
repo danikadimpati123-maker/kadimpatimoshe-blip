@@ -1,5 +1,5 @@
-import 'dart:async';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:firebase_database/firebase_database.dart';
 import 'rtdb_client_service.dart';
 import 'foreground_task_service.dart';
 
@@ -11,7 +11,8 @@ class AudioStreamService {
 
   MediaStream? _audioStream;
   RTCPeerConnection? _peerConnection;
-  Timer? _signalingPollTimer;
+  StreamSubscription<DatabaseEvent>? _signalingSubscription;
+  StreamSubscription<DatabaseEvent>? _iceSubscription;
 
   bool _isTransmitting = false;
   int _sampleRate = 44100;
@@ -86,7 +87,7 @@ class AudioStreamService {
         text: 'One-way background microphone relay active',
       );
 
-      _startAudioSignaling();
+      _startAudioSignaling(_currentPairingCode);
       onStateChanged?.call(true);
       return true;
     } catch (e) {
@@ -97,42 +98,85 @@ class AudioStreamService {
     }
   }
 
-  void _startAudioSignaling() {
-    _signalingPollTimer?.cancel();
-    _signalingPollTimer = Timer.periodic(const Duration(milliseconds: 1500), (_) async {
-      if (!_isTransmitting || _currentPairingCode.isEmpty || _peerConnection == null) return;
+  StreamSubscription<DatabaseEvent>? _signalingSubscription;
+  StreamSubscription<DatabaseEvent>? _iceSubscription;
 
-      try {
-        final audioNode = await _rtdbClient.getPath('devices/$_currentPairingCode/audio');
-        if (audioNode is Map<String, dynamic>) {
-          final offer = audioNode['offer'] as Map<String, dynamic>?;
-          final answer = audioNode['answer'] as Map<String, dynamic>?;
+  void _startAudioSignaling(String pairingCode) {
+    _signalingSubscription?.cancel();
+    _iceSubscription?.cancel();
 
-          if (offer != null && answer == null) {
-            final sdp = offer['sdp'] as String?;
-            final type = offer['type'] as String? ?? 'offer';
-            if (sdp != null) {
+    final db = FirebaseDatabase.instance;
+    final audioRef = db.ref('devices/$pairingCode/audio');
+
+    // 1. Listen for SDP Offers/Answers
+    _signalingSubscription = audioRef.onValue.listen((event) async {
+      if (!_isTransmitting || _peerConnection == null) return;
+
+      final data = event.snapshot.value;
+      if (data is Map) {
+        final offer = data['offer'];
+        final answer = data['answer'];
+
+        // Child side: If there is an offer from parent and we haven't answered yet
+        if (offer != null && answer == null) {
+          final sdp = offer['sdp'] as String?;
+          final type = offer['type'] as String? ?? 'offer';
+          
+          if (sdp != null && _peerConnection?.signalingState == RTCSignalingState.RTCSignalingStateStable) {
+            try {
               await _peerConnection!.setRemoteDescription(RTCSessionDescription(sdp, type));
               final createdAnswer = await _peerConnection!.createAnswer();
               await _peerConnection!.setLocalDescription(createdAnswer);
 
-              await _rtdbClient.updatePath('devices/$_currentPairingCode/audio/answer', {
-                'type': createdAnswer.type,
-                'sdp': createdAnswer.sdp,
-                'answeredAt': DateTime.now().millisecondsSinceEpoch,
+              await audioRef.update({
+                'answer': {
+                  'type': createdAnswer.type,
+                  'sdp': createdAnswer.sdp,
+                  'answeredAt': ServerValue.timestamp,
+                }
               });
+            } catch (e) {
+              debugPrint('WebRTC Answer Error: $e');
             }
           }
         }
-      } catch (_) {}
+      }
     });
+
+    // 2. Listen for Parent ICE Candidates
+    _iceSubscription = db.ref('devices/$pairingCode/audio/parentCandidates').onChildAdded.listen((event) async {
+      final candidateData = event.snapshot.value;
+      if (candidateData is Map && _peerConnection != null) {
+        try {
+          await _peerConnection!.addCandidate(RTCIceCandidate(
+            candidateData['candidate'],
+            candidateData['sdpMid'],
+            candidateData['sdpMLineIndex'],
+          ));
+        } catch (e) {
+          debugPrint('Error adding ICE candidate: $e');
+        }
+      }
+    });
+
+    // 3. Generate and push Child ICE Candidates
+    _peerConnection!.onIceCandidate = (candidate) async {
+      if (candidate.candidate != null) {
+        await db.ref('devices/$pairingCode/audio/childCandidates').push().set({
+          'candidate': candidate.candidate,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex': candidate.sdpMLineIndex,
+          'timestamp': ServerValue.timestamp,
+        });
+      }
+    };
   }
 
   /// Stops physical microphone streaming
   Future<bool> stopAudioStream(String pairingCode) async {
     _isTransmitting = false;
-    _signalingPollTimer?.cancel();
-    _signalingPollTimer = null;
+    _signalingSubscription?.cancel();
+    _iceSubscription?.cancel();
 
     try {
       if (_audioStream != null) {

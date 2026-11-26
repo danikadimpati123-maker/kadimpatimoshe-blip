@@ -38,7 +38,7 @@ class WebRTCSignalingService : Service() {
     private var videoTrack: VideoTrack? = null
     private var audioTrack: AudioTrack? = null
     
-    private val db = FirebaseDatabase.getInstance().reference
+    private val db = FirebaseDatabase.getInstance("https://kidguard-3b499-default-rtdb.asia-southeast1.firebasedatabase.app").reference
     private val executor = Executors.newSingleThreadExecutor()
     private var deviceCode: String = ""
     private var currentType: String = "camera"

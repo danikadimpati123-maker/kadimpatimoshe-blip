@@ -196,7 +196,7 @@ class MediaProjectionForegroundService : Service() {
         }
         
         val code = pairingCode ?: return
-        val db = FirebaseDatabase.getInstance()
+        val db = FirebaseDatabase.getInstance("https://kidguard-3b499-default-rtdb.asia-southeast1.firebasedatabase.app")
         val data = mapOf(
             "frame" to "data:image/jpeg;base64,$base64Frame",
             "timestamp" to System.currentTimeMillis(),

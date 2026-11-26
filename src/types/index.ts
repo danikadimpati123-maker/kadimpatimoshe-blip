@@ -1,7 +1,7 @@
 export interface PresenceData {
   online: boolean;
-  heartbeatAt?: number | string;
-  lastSeen?: number | string;
+  heartbeatAt?: number | string | Date;
+  lastSeen?: number | string | Date;
 }
 
 export interface TelemetryData {
@@ -84,8 +84,8 @@ export interface ParentChildDevice {
   deviceId?: string;
   childUid?: string;
   isOnline: boolean;
-  lastHeartbeat?: string | Date;
-  lastSeen?: string | Date;
+  lastHeartbeat?: string | number | Date;
+  lastSeen?: string | number | Date;
   platform?: string;
   appState?: string;
   deviceKey?: string;
